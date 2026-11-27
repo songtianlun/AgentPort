@@ -1,11 +1,11 @@
 use crate::models::*;
 use crate::planner::{deterministic_op_id, resolve_agent_target, resolve_project_target};
-use crate::t3_reader::{load_thread_detail, scan_database};
+use crate::t3_reader::{expand_tilde, load_thread_detail, scan_database};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn export_bundle(
     db_path: &Path,
@@ -13,7 +13,7 @@ pub fn export_bundle(
     req: &ExportRequest,
 ) -> Result<ExportResult, String> {
     let scan = scan_database(db_path)?;
-    let out_dir = PathBuf::from(&req.output_dir);
+    let out_dir = expand_tilde(&req.output_dir);
     let threads_dir = out_dir.join("threads");
     fs::create_dir_all(&threads_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
 

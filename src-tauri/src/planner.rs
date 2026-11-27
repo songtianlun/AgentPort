@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::t3_reader::expand_tilde;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -177,9 +178,9 @@ pub fn load_catalog_file(path: &Path) -> Result<LodyCatalog, String> {
     serde_json::from_str(&raw).map_err(|e| format!("解析 Lody Catalog JSON 失败: {e}"))
 }
 
-pub fn load_catalog_with_fallback(explicit_path: Option<&Path>) -> Result<LodyCatalog, String> {
-    if let Some(p) = explicit_path {
-        return load_catalog_file(p);
+pub fn load_catalog_with_fallback(explicit_path: Option<&str>) -> Result<LodyCatalog, String> {
+    if let Some(p) = explicit_path.map(str::trim).filter(|s| !s.is_empty()) {
+        return load_catalog_file(&expand_tilde(p));
     }
     let mut candidates = Vec::new();
     if let Some(home) = dirs::home_dir() {

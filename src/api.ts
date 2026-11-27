@@ -24,11 +24,11 @@ export async function getRuntimeInfo(): Promise<{
   defaultOutputDir: string;
 }> {
   if (isTauriRuntime()) {
-    return {
-      runtime: 'tauri-native',
-      defaultDbPath: '~/.t3/userdata/statev2.sqlite',
-      defaultOutputDir: './migration-bundle',
-    };
+    return tauriInvoke<{
+      runtime: 'tauri-native';
+      defaultDbPath: string;
+      defaultOutputDir: string;
+    }>('get_runtime_info');
   }
   const h = await httpJson<{
     runtime: 'web-bridge';

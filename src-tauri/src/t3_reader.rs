@@ -7,10 +7,43 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub fn expand_tilde(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        return dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest);
+    }
+    PathBuf::from(trimmed)
+}
+
 pub fn default_db_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let v2 = home.join(".t3/userdata/statev2.sqlite");
+    if v2.exists() {
+        return v2;
+    }
+    let v1 = home.join(".t3/userdata/state.sqlite");
+    if v1.exists() {
+        return v1;
+    }
+    v2
+}
+
+pub fn default_output_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".t3/userdata/statev2.sqlite")
+        .join("AgentPort-migration-bundle")
+}
+
+pub fn resolve_db_path(db_path: Option<&str>) -> PathBuf {
+    match db_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => expand_tilde(raw),
+        None => default_db_path(),
+    }
 }
 
 pub fn attachments_dir_for_db(db_path: &Path) -> PathBuf {
@@ -24,11 +57,13 @@ pub fn open_readonly(db_path: &Path) -> Result<Connection, String> {
     if !db_path.exists() {
         return Err(format!("T3 Code 数据库不存在: {}", db_path.display()));
     }
-    Connection::open_with_flags(
+    let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| format!("以只读模式打开 SQLite 失败: {e}"))
+    .map_err(|e| format!("以只读模式打开 SQLite 失败: {e}"))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+    Ok(conn)
 }
 
 pub fn parse_github_repo(remote: &str) -> Option<String> {

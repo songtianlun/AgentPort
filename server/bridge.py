@@ -498,8 +498,8 @@ def resolve_agent_target(
 
 
 def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
-    db_path = Path(req.get("dbPath") or DEFAULT_DB)
-    out_dir = Path(req.get("outputDir") or DEFAULT_OUTPUT)
+    db_path = Path(req["dbPath"]).expanduser() if req.get("dbPath") else DEFAULT_DB
+    out_dir = Path(req["outputDir"]).expanduser() if req.get("outputDir") else DEFAULT_OUTPUT
     target_machine_id = req["targetMachineId"]
     selected = set(req.get("selectedThreadIds") or [])
     include_archived = bool(req.get("includeArchived", False))
@@ -708,13 +708,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     },
                 )
             elif parsed.path == "/api/scan":
-                db = Path(qs["dbPath"][0]) if "dbPath" in qs and qs["dbPath"][0] else DEFAULT_DB
+                db = Path(qs["dbPath"][0]).expanduser() if "dbPath" in qs and qs["dbPath"][0] else DEFAULT_DB
                 self._send_json(200, scan_database(db))
             elif parsed.path == "/api/catalog":
                 self._send_json(200, load_catalog())
             elif parsed.path.startswith("/api/thread/"):
                 tid = parsed.path[len("/api/thread/") :]
-                db = Path(qs["dbPath"][0]) if "dbPath" in qs and qs["dbPath"][0] else DEFAULT_DB
+                db = Path(qs["dbPath"][0]).expanduser() if "dbPath" in qs and qs["dbPath"][0] else DEFAULT_DB
                 self._send_json(200, load_thread_detail(db, tid))
             else:
                 self._send_json(404, {"error": f"Unknown endpoint: {parsed.path}"})
