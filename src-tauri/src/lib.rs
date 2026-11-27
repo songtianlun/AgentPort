@@ -59,6 +59,21 @@ fn register_lody_local_project(
     lody_discovery::register_local_project(&root_path, workspace_id.as_deref())
 }
 
+#[tauri::command]
+fn read_migration_state(output_dir: String) -> Vec<MigrationStateRecord> {
+    exporter::load_migration_state(&output_dir)
+}
+
+#[tauri::command]
+fn import_to_lody(
+    request: ImportToLodyRequest,
+    catalog_path: Option<String>,
+) -> Result<ImportToLodyResult, String> {
+    let db = t3_reader::resolve_db_path(request.export_request.db_path.as_deref());
+    let catalog = planner::load_catalog_with_fallback(catalog_path.as_deref())?;
+    exporter::import_to_lody(&db, &catalog, &request)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -68,7 +83,9 @@ pub fn run() {
             get_thread_detail,
             get_lody_catalog,
             register_lody_local_project,
-            export_migration_bundle
+            export_migration_bundle,
+            read_migration_state,
+            import_to_lody
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

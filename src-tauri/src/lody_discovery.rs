@@ -8,11 +8,19 @@ use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct DaemonRunInfo {
+    pub pid: Option<u64>,
     pub data_dir: PathBuf,
     pub socket_path: String,
     pub control_socket_path: String,
     pub token: Option<String>,
     pub version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LodyCliCommand {
+    pub program: PathBuf,
+    pub prefix_args: Vec<String>,
+    pub extra_env: Vec<(String, String)>,
 }
 
 fn candidate_lody_data_dirs() -> Vec<PathBuf> {
@@ -49,6 +57,7 @@ pub fn find_running_daemon() -> Option<DaemonRunInfo> {
             continue;
         };
         return Some(DaemonRunInfo {
+            pid: v.get("pid").and_then(|p| p.as_u64()),
             data_dir,
             socket_path: socket_path.to_string(),
             control_socket_path: control_socket_path.to_string(),
@@ -279,12 +288,63 @@ fn detect_local_agent_configs(data_dir: &Path, machine_id: &str) -> Vec<LodyAgen
     configs
 }
 
-fn find_lody_cli_bin() -> Option<PathBuf> {
+#[cfg(target_os = "linux")]
+fn discover_bundled_cli_from_pid(pid: u64) -> Option<LodyCliCommand> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let parts: Vec<String> = raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let exe = PathBuf::from(&parts[0]);
+    let cli_js = parts
+        .iter()
+        .skip(1)
+        .find(|a| a.ends_with("cli/index.js") || a.ends_with("cli\\index.js"))?
+        .clone();
+    if !exe.exists() || !Path::new(&cli_js).exists() {
+        return None;
+    }
+    Some(LodyCliCommand {
+        program: exe,
+        prefix_args: vec![cli_js],
+        extra_env: vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())],
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn discover_bundled_cli_from_pid(_pid: u64) -> Option<LodyCliCommand> {
+    // Check macOS Lody.app bundle as fallback
+    #[cfg(target_os = "macos")]
+    {
+        let app_exe = PathBuf::from("/Applications/Lody.app/Contents/MacOS/Lody");
+        let cli_js = PathBuf::from(
+            "/Applications/Lody.app/Contents/Resources/app.asar.unpacked/resources/cli/index.js",
+        );
+        if app_exe.exists() && cli_js.exists() {
+            return Some(LodyCliCommand {
+                program: app_exe,
+                prefix_args: vec![cli_js.display().to_string()],
+                extra_env: vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())],
+            });
+        }
+    }
+    None
+}
+
+pub fn find_lody_cli_command(daemon: Option<&DaemonRunInfo>) -> Option<LodyCliCommand> {
     if let Ok(out) = Command::new("which").arg("lody").output() {
         if out.status.success() {
             let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
             if p.exists() {
-                return Some(p);
+                return Some(LodyCliCommand {
+                    program: p,
+                    prefix_args: vec![],
+                    extra_env: vec![],
+                });
             }
         }
     }
@@ -296,21 +356,63 @@ fn find_lody_cli_bin() -> Option<PathBuf> {
             PathBuf::from("/opt/homebrew/bin/lody"),
         ] {
             if cand.exists() {
-                return Some(cand);
+                return Some(LodyCliCommand {
+                    program: cand,
+                    prefix_args: vec![],
+                    extra_env: vec![],
+                });
             }
+        }
+    }
+    if let Some(pid) = daemon.and_then(|d| d.pid) {
+        if let Some(bundled) = discover_bundled_cli_from_pid(pid) {
+            return Some(bundled);
         }
     }
     None
 }
 
-fn run_lody_cli_json(bin: &Path, args: &[&str]) -> Option<Value> {
-    let out = Command::new(bin).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
+pub fn run_lody_cli_json_cmd(cli: &LodyCliCommand, args: &[String]) -> Result<Value, String> {
+    let mut cmd = Command::new(&cli.program);
+    for arg in &cli.prefix_args {
+        cmd.arg(arg);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let start = text.find('{')?;
-    serde_json::from_str::<Value>(&text[start..]).ok()
+    for arg in args {
+        cmd.arg(arg);
+    }
+    for (k, v) in &cli.extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 Lody CLI 失败 ({}): {e}", cli.program.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(format!(
+            "Lody CLI 执行失败 (exit {:?}): {}",
+            out.status.code(),
+            detail.chars().take(500).collect::<String>()
+        ));
+    }
+    let start = stdout
+        .find('{')
+        .ok_or_else(|| format!("Lody CLI 未返回 JSON 输出: {}", stdout.chars().take(300).collect::<String>()))?;
+    serde_json::Deserializer::from_str(&stdout[start..])
+        .into_iter::<Value>()
+        .next()
+        .ok_or_else(|| "解析 Lody CLI JSON 输出为空".to_string())?
+        .map_err(|e| format!("解析 Lody CLI JSON 失败: {e}"))
+}
+
+fn run_lody_cli_json(cli: &LodyCliCommand, args: &[&str]) -> Option<Value> {
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    run_lody_cli_json_cmd(cli, &owned).ok()
 }
 
 pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
@@ -413,10 +515,10 @@ pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
     let mut agent_configs = detect_local_agent_configs(&daemon.data_dir, &machine_id);
     let mut source = "lody-daemon-ipc".to_string();
 
-    // Optional enrichment from `lody` CLI if present on PATH (adds GitHub repos, other machines, exact agentConfigIds)
-    if let Some(cli_bin) = find_lody_cli_bin() {
+    // Optional enrichment from `lody` CLI or running Lody Desktop's bundled CLI (adds GitHub repos, other machines, exact agentConfigIds)
+    if let Some(cli_cmd) = find_lody_cli_command(Some(&daemon)) {
         let mut enriched = false;
-        if let Some(m_json) = run_lody_cli_json(&cli_bin, &["machine", "list", "--json", "--all-pages"]) {
+        if let Some(m_json) = run_lody_cli_json(&cli_cmd, &["machine", "list", "--json", "--all-pages"]) {
             if let Some(items) = m_json.get("items").and_then(|v| v.as_array()) {
                 let mut cli_machines = Vec::new();
                 for m in items {
@@ -442,7 +544,7 @@ pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
             }
         }
         if let Some(p_json) =
-            run_lody_cli_json(&cli_bin, &["project", "list", "--catalog", "--json", "--all-pages"])
+            run_lody_cli_json(&cli_cmd, &["project", "list", "--catalog", "--json", "--all-pages"])
         {
             if let Some(items) = p_json.get("items").and_then(|v| v.as_array()) {
                 let mut existing_ids: HashSet<String> = projects.iter().map(|p| p.id.clone()).collect();
@@ -472,7 +574,7 @@ pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
             }
         }
         if let Some(a_json) =
-            run_lody_cli_json(&cli_bin, &["agent-config", "list", "--json", "--all-pages"])
+            run_lody_cli_json(&cli_cmd, &["agent-config", "list", "--json", "--all-pages"])
         {
             if let Some(items) = a_json.get("items").and_then(|v| v.as_array()) {
                 let mut cli_agents = Vec::new();

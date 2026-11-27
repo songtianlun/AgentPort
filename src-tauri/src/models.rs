@@ -202,3 +202,56 @@ pub struct ExportResult {
     pub lody_batch_path: String,
     pub state_path: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationStateRecord {
+    pub source_thread_id: String,
+    pub source_project_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub operation_id: String,
+    pub status: String, // "planned_ready" | "action_required" | "imported" | "failed"
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub lody_session_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub exported_at: String,
+    #[serde(default)]
+    pub imported_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportToLodyRequest {
+    pub export_request: ExportRequest,
+    pub max_count: Option<usize>,
+    #[serde(default)]
+    pub force_reimport: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportItemOutcome {
+    pub source_thread_id: String,
+    pub title: String,
+    pub operation_id: String,
+    pub status: String, // "imported" | "skipped_imported" | "skipped_not_ready" | "failed"
+    pub lody_session_id: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportToLodyResult {
+    pub output_dir: String,
+    pub state_path: String,
+    pub total_considered: usize,
+    pub imported_now: usize,
+    pub skipped_already_imported: usize,
+    pub skipped_not_ready: usize,
+    pub failed: usize,
+    pub items: Vec<ImportItemOutcome>,
+    pub state_records: Vec<MigrationStateRecord>,
+}

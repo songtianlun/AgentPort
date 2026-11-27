@@ -166,6 +166,45 @@ def _detect_local_agents(data_dir: Path, machine_id: str) -> list[dict[str, Any]
     return res
 
 
+def _find_lody_cli_command(daemon: dict[str, Any] | None) -> tuple[list[str], dict[str, str]] | None:
+    which_lody = shutil.which("lody")
+    if which_lody:
+        return [which_lody], {}
+    for cand in [
+        Path.home() / ".local" / "bin" / "lody",
+        Path.home() / ".lody" / "daemon-managed" / "service",
+        Path("/usr/local/bin/lody"),
+        Path("/opt/homebrew/bin/lody"),
+    ]:
+        if cand.exists():
+            return [str(cand)], {}
+    if daemon and daemon.get("pid"):
+        proc_cmd = Path(f"/proc/{daemon['pid']}/cmdline")
+        if proc_cmd.exists():
+            try:
+                parts = [p.decode("utf-8", errors="replace") for p in proc_cmd.read_bytes().split(b"\x00") if p]
+                cli_js = next((a for a in parts[1:] if a.endswith("cli/index.js")), None)
+                if parts and cli_js and Path(parts[0]).exists() and Path(cli_js).exists():
+                    return [parts[0], cli_js], {"ELECTRON_RUN_AS_NODE": "1"}
+            except Exception:
+                pass
+    return None
+
+
+def _run_lody_cli_json(cli: tuple[list[str], dict[str, str]], args: list[str]) -> dict[str, Any]:
+    prefix, extra_env = cli
+    env = {**os.environ, **extra_env}
+    r = subprocess.run([*prefix, *args], env=env, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        detail = (r.stderr.strip() or r.stdout.strip())[:500]
+        raise RuntimeError(f"Lody CLI 执行失败 (exit {r.returncode}): {detail}")
+    idx = r.stdout.find("{")
+    if idx < 0:
+        raise RuntimeError(f"Lody CLI 未返回 JSON: {r.stdout[:300]}")
+    obj, _ = json.JSONDecoder().raw_decode(r.stdout, idx)
+    return obj
+
+
 def _discover_live_catalog() -> dict[str, Any] | None:
     daemon = _find_running_daemon()
     if not daemon:
@@ -203,15 +242,42 @@ def _discover_live_catalog() -> dict[str, Any] | None:
                         "available": True,
                     }
                 )
+        machines = [{"id": machine_id, "name": socket.gethostname(), "onlineStatus": "online"}]
+        agent_configs = _detect_local_agents(daemon["_dataDir"], machine_id)
+        source = "lody-daemon-ipc"
+        cli = _find_lody_cli_command(daemon)
+        if cli:
+            try:
+                a_json = _run_lody_cli_json(cli, ["agent-config", "list", "--json", "--all-pages"])
+                cli_agents = []
+                for a in a_json.get("items") or []:
+                    rc = a.get("runConfig") or {}
+                    cli_agents.append(
+                        {
+                            "id": a["id"],
+                            "name": a["name"],
+                            "machineId": a["machineId"],
+                            "agentType": a.get("agentType") or "unknown",
+                            "available": (a.get("availability") or {}).get("state") == "available",
+                            "modes": [m["id"] for m in rc.get("modes") or []],
+                            "models": [m["id"] for m in rc.get("models") or []],
+                            "planMode": bool(rc.get("planMode")),
+                            "fastMode": bool(rc.get("fastMode")),
+                        }
+                    )
+                if cli_agents:
+                    agent_configs = cli_agents
+                    source = "lody-daemon+cli"
+            except Exception:
+                pass
+
         return {
             "workspaceId": workspace_id,
             "defaultMachineId": machine_id,
-            "machines": [
-                {"id": machine_id, "name": socket.gethostname(), "onlineStatus": "online"}
-            ],
+            "machines": machines,
             "projects": projects,
-            "agentConfigs": _detect_local_agents(daemon["_dataDir"], machine_id),
-            "source": "lody-daemon-ipc",
+            "agentConfigs": agent_configs,
+            "source": source,
             "sourceDetail": f"已实时连接本机 Lody Daemon (v{cli_ver}) · 工作区「{ws_name}」· 发现 {len(projects)} 个本地项目",
             "daemonConnected": True,
         }
@@ -772,6 +838,25 @@ def resolve_agent_target(
     return cfg["id"], resolved_model, resolved_mode, warnings
 
 
+def load_migration_state(output_dir: str) -> list[dict[str, Any]]:
+    state_p = Path(output_dir).expanduser() / "migration-state.json"
+    if not state_p.exists():
+        return []
+    try:
+        return json.loads(state_p.read_text(encoding="utf-8")).get("records") or []
+    except Exception:
+        return []
+
+
+def save_migration_state(state_p: Path, records: list[dict[str, Any]]) -> None:
+    tmp = state_p.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps({"version": 1, "updatedAt": utc_now(), "records": records}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(state_p)
+
+
 def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
     db_path = Path(req["dbPath"]).expanduser() if req.get("dbPath") else DEFAULT_DB
     out_dir = Path(req["outputDir"]).expanduser() if req.get("outputDir") else DEFAULT_OUTPUT
@@ -787,6 +872,9 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
 
     threads_dir = out_dir / "threads"
     threads_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_by_tid = {r["sourceThreadId"]: r for r in load_migration_state(str(out_dir))}
+    seen_tids: set[str] = set()
 
     files_written: list[str] = []
     lody_create_items: list[dict[str, Any]] = []
@@ -824,6 +912,7 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
         )
         warnings.extend(agent_warnings)
         warning_count += len(warnings)
+        agent_name = next((c["name"] for c in catalog["agentConfigs"] if c["id"] == agent_id), None)
 
         detail = load_thread_detail(db_path, t["id"])
         t_dir = threads_dir / t["id"]
@@ -836,11 +925,13 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
         trans_p.write_text(detail["transcriptMarkdown"], encoding="utf-8")
         handoff_p.write_text(detail["handoffMarkdown"], encoding="utf-8")
         files_written.extend([str(raw_p), str(trans_p), str(handoff_p)])
+        attach_paths = [str(trans_p)]
 
         if detail["uncommittedDiff"]:
             patch_p = t_dir / "dirty.patch"
             patch_p.write_text(detail["uncommittedDiff"], encoding="utf-8")
             files_written.append(str(patch_p))
+            attach_paths.append(str(patch_p))
             patches_saved += 1
 
         att_dir = t_dir / "attachments"
@@ -851,20 +942,27 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
                     dst = att_dir / f"{a['id']}_{a['name']}"
                     shutil.copy2(a["localPath"], dst)
                     attachments_copied += 1
+                    if len(attach_paths) < 8:
+                        attach_paths.append(str(dst))
 
         op_id = deterministic_op_id(t["id"])
         ready = proj_status != "action_required" and agent_id is not None
         if ready:
             ready_for_lody += 1
             item: dict[str, Any] = {
+                "sourceThreadId": t["id"],
                 "operationId": op_id,
+                "title": t["title"][:200],
                 "label": t["title"][:120],
+                "workspaceId": catalog["workspaceId"],
                 "machineId": target_machine_id,
                 "agentConfigId": agent_id,
+                "agentName": agent_name,
                 "useCurrentSessionAsParent": False,
                 "workContext": work_context,
+                "promptFile": str(handoff_p),
                 "prompt": detail["handoffMarkdown"],
-                "attachments": [str(trans_p)],
+                "attachments": attach_paths,
             }
             if model_id:
                 item["modelId"] = model_id
@@ -879,18 +977,30 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-        state_records.append(
-            {
-                "sourceThreadId": t["id"],
-                "sourceProjectId": t["projectId"],
-                "operationId": op_id,
-                "status": "planned_ready" if ready else "action_required",
-                "warnings": warnings,
-                "lodySessionId": None,
-                "exportedAt": utc_now(),
-            }
-        )
+        seen_tids.add(t["id"])
+        old = existing_by_tid.get(t["id"])
+        if old and old.get("status") == "imported" and old.get("lodySessionId"):
+            state_records.append({**old, "title": t["title"], "warnings": warnings, "exportedAt": utc_now()})
+        else:
+            state_records.append(
+                {
+                    "sourceThreadId": t["id"],
+                    "sourceProjectId": t["projectId"],
+                    "title": t["title"],
+                    "operationId": op_id,
+                    "status": "planned_ready" if ready else "action_required",
+                    "warnings": warnings,
+                    "lodySessionId": None,
+                    "lastError": None,
+                    "exportedAt": utc_now(),
+                    "importedAt": None,
+                }
+            )
         exported_threads += 1
+
+    for tid, old in existing_by_tid.items():
+        if tid not in seen_tids and old.get("status") == "imported":
+            state_records.append(old)
 
     manifest_p = out_dir / "manifest.json"
     manifest_p.write_text(
@@ -925,18 +1035,7 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
     )
 
     state_p = out_dir / "migration-state.json"
-    state_p.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "updatedAt": utc_now(),
-                "records": state_records,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    save_migration_state(state_p, state_records)
 
     files_written.extend([str(manifest_p), str(batch_p), str(state_p)])
     return {
@@ -950,6 +1049,137 @@ def export_bundle(req: dict[str, Any]) -> dict[str, Any]:
         "filesWritten": files_written,
         "lodyBatchPath": str(batch_p),
         "statePath": str(state_p),
+    }
+
+
+def import_to_lody(req: dict[str, Any]) -> dict[str, Any]:
+    daemon = _find_running_daemon()
+    cli = _find_lody_cli_command(daemon)
+    if not cli:
+        raise RuntimeError("未找到本机可用的 Lody CLI（请确认 Lody Desktop 正在运行，或已将 lody 加入 PATH）")
+
+    export_res = export_bundle(req["exportRequest"])
+    batch = json.loads(Path(export_res["lodyBatchPath"]).read_text(encoding="utf-8"))
+    create_items = batch.get("createSessions") or []
+    state_p = Path(export_res["statePath"])
+    state_records = load_migration_state(export_res["outputDir"])
+
+    max_count = req.get("maxCount")
+    force_reimport = bool(req.get("forceReimport", False))
+
+    items_out = []
+    imported_now = 0
+    skipped_already_imported = 0
+    skipped_not_ready = export_res["actionRequiredCount"]
+    failed = 0
+    attempted = 0
+
+    for item in create_items:
+        tid = item.get("sourceThreadId") or ""
+        op_id = item.get("operationId") or ""
+        title = item.get("title") or "Imported Session"
+        rec = next((r for r in state_records if r["sourceThreadId"] == tid), None)
+        if rec and not force_reimport and rec.get("status") == "imported" and rec.get("lodySessionId"):
+            skipped_already_imported += 1
+            items_out.append(
+                {
+                    "sourceThreadId": tid,
+                    "title": title,
+                    "operationId": op_id,
+                    "status": "skipped_imported",
+                    "lodySessionId": rec["lodySessionId"],
+                    "message": "已在历史迁移中导入，自动幂等跳过",
+                }
+            )
+            continue
+
+        if max_count is not None and attempted >= int(max_count):
+            break
+        attempted += 1
+
+        args = ["session", "create", "--json"]
+        ws = item.get("workspaceId")
+        if ws and ws != "local-workspace":
+            args += ["--workspace", ws]
+        if item.get("machineId"):
+            args += ["--machine", item["machineId"]]
+        agent_sel = item.get("agentConfigId")
+        if not agent_sel or str(agent_sel).startswith("local-"):
+            agent_sel = item.get("agentName")
+        if agent_sel:
+            args += ["--agent", agent_sel]
+        args += ["--title", title]
+
+        wc = item.get("workContext") or {}
+        if wc.get("kind") == "local" and wc.get("projectId"):
+            args += ["--local-project", wc["projectId"]]
+            if wc.get("branch"):
+                args += ["--branch", wc["branch"]]
+        elif wc.get("kind") == "github" and wc.get("repo"):
+            args += ["--repo", wc["repo"]]
+            if wc.get("branch"):
+                args += ["--branch", wc["branch"]]
+
+        if item.get("modelId"):
+            args += ["--model", item["modelId"]]
+        if item.get("modeId"):
+            args += ["--mode", item["modeId"]]
+        for ap in item.get("attachments") or []:
+            if Path(ap).exists():
+                args += ["--attach", ap]
+        if item.get("promptFile"):
+            args += ["--prompt-file", item["promptFile"]]
+
+        try:
+            resp = _run_lody_cli_json(cli, args)
+            sid = resp.get("sessionId")
+            if resp.get("ok") and sid:
+                imported_now += 1
+                if rec:
+                    rec["status"] = "imported"
+                    rec["lodySessionId"] = sid
+                    rec["lastError"] = None
+                    rec["importedAt"] = utc_now()
+                save_migration_state(state_p, state_records)
+                items_out.append(
+                    {
+                        "sourceThreadId": tid,
+                        "title": title,
+                        "operationId": op_id,
+                        "status": "imported",
+                        "lodySessionId": sid,
+                        "message": "导入成功",
+                    }
+                )
+            else:
+                raise RuntimeError(resp.get("error") or resp.get("message") or "Lody 返回非成功状态")
+        except Exception as exc:
+            failed += 1
+            if rec:
+                rec["status"] = "failed"
+                rec["lastError"] = str(exc)
+            save_migration_state(state_p, state_records)
+            items_out.append(
+                {
+                    "sourceThreadId": tid,
+                    "title": title,
+                    "operationId": op_id,
+                    "status": "failed",
+                    "lodySessionId": None,
+                    "message": str(exc),
+                }
+            )
+
+    return {
+        "outputDir": export_res["outputDir"],
+        "statePath": export_res["statePath"],
+        "totalConsidered": len(create_items),
+        "importedNow": imported_now,
+        "skippedAlreadyImported": skipped_already_imported,
+        "skippedNotReady": skipped_not_ready,
+        "failed": failed,
+        "items": items_out,
+        "stateRecords": state_records,
     }
 
 
@@ -987,6 +1217,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(200, scan_database(db))
             elif parsed.path == "/api/catalog":
                 self._send_json(200, load_catalog())
+            elif parsed.path == "/api/state":
+                out_dir = qs["outputDir"][0] if "outputDir" in qs and qs["outputDir"][0] else str(DEFAULT_OUTPUT)
+                self._send_json(200, load_migration_state(out_dir))
             elif parsed.path.startswith("/api/thread/"):
                 tid = parsed.path[len("/api/thread/") :]
                 db = Path(qs["dbPath"][0]).expanduser() if "dbPath" in qs and qs["dbPath"][0] else DEFAULT_DB
@@ -1004,6 +1237,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
             if parsed.path == "/api/export":
                 self._send_json(200, export_bundle(body))
+            elif parsed.path == "/api/import-lody":
+                self._send_json(200, import_to_lody(body))
             elif parsed.path == "/api/lody/register-project":
                 self._send_json(
                     200,

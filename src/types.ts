@@ -188,3 +188,43 @@ export interface ExportResult {
   lodyBatchPath: string;
   statePath: string;
 }
+
+export interface MigrationStateRecord {
+  sourceThreadId: string;
+  sourceProjectId: string;
+  title?: string | null;
+  operationId: string;
+  status: 'planned_ready' | 'action_required' | 'imported' | 'failed' | string;
+  warnings: string[];
+  lodySessionId: string | null;
+  lastError?: string | null;
+  exportedAt: string;
+  importedAt?: string | null;
+}
+
+export interface ImportToLodyRequest {
+  exportRequest: ExportRequest;
+  maxCount?: number | null;
+  forceReimport?: boolean;
+}
+
+export interface ImportItemOutcome {
+  sourceThreadId: string;
+  title: string;
+  operationId: string;
+  status: 'imported' | 'skipped_imported' | 'skipped_not_ready' | 'failed' | string;
+  lodySessionId: string | null;
+  message?: string | null;
+}
+
+export interface ImportToLodyResult {
+  outputDir: string;
+  statePath: string;
+  totalConsidered: number;
+  importedNow: number;
+  skippedAlreadyImported: number;
+  skippedNotReady: number;
+  failed: number;
+  items: ImportItemOutcome[];
+  stateRecords: MigrationStateRecord[];
+}

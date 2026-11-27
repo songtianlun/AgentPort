@@ -1,8 +1,11 @@
 import type {
   ExportRequest,
   ExportResult,
+  ImportToLodyRequest,
+  ImportToLodyResult,
   LodyCatalog,
   LodyProject,
+  MigrationStateRecord,
   T3ScanResult,
   T3ThreadDetail,
 } from './types';
@@ -96,6 +99,29 @@ export async function exportMigrationBundle(request: ExportRequest): Promise<Exp
     });
   }
   return httpJson<ExportResult>('/api/export', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+export async function readMigrationState(outputDir: string): Promise<MigrationStateRecord[]> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<MigrationStateRecord[]>('read_migration_state', { outputDir });
+  }
+  return httpJson<MigrationStateRecord[]>(
+    `/api/state?outputDir=${encodeURIComponent(outputDir)}`
+  );
+}
+
+export async function importToLody(request: ImportToLodyRequest): Promise<ImportToLodyResult> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<ImportToLodyResult>('import_to_lody', {
+      request,
+      catalogPath: null,
+    });
+  }
+  return httpJson<ImportToLodyResult>('/api/import-lody', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
