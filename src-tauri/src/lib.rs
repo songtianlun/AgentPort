@@ -22,22 +22,10 @@ fn get_thread_detail(db_path: Option<String>, thread_id: String) -> Result<T3Thr
     t3_reader::load_thread_detail(&path, &thread_id)
 }
 
-fn resolve_catalog_path(catalog_path: Option<String>) -> PathBuf {
-    if let Some(p) = catalog_path {
-        return PathBuf::from(p);
-    }
-    let local = PathBuf::from("../data/lody-catalog.json");
-    if local.exists() {
-        local
-    } else {
-        PathBuf::from("../data/lody-catalog.example.json")
-    }
-}
-
 #[tauri::command]
 fn get_lody_catalog(catalog_path: Option<String>) -> Result<LodyCatalog, String> {
-    let path = resolve_catalog_path(catalog_path);
-    planner::load_catalog_file(&path)
+    let explicit = catalog_path.map(PathBuf::from);
+    planner::load_catalog_with_fallback(explicit.as_deref())
 }
 
 #[tauri::command]
@@ -50,8 +38,8 @@ fn export_migration_bundle(
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(t3_reader::default_db_path);
-    let cat_path = resolve_catalog_path(catalog_path);
-    let catalog = planner::load_catalog_file(&cat_path)?;
+    let explicit = catalog_path.map(PathBuf::from);
+    let catalog = planner::load_catalog_with_fallback(explicit.as_deref())?;
     exporter::export_bundle(&db, &catalog, &request)
 }
 

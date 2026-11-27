@@ -83,6 +83,20 @@ npm run dev                # 启动 Vite 前端 http://127.0.0.1:5173
 
 ---
 
+## 自动构建与发版（GitHub Actions）
+
+仓库内置两套自动化工作流：
+
+- **持续集成（`.github/workflows/ci.yml`）**：每次推送到 `main` 或发起 PR 时自动执行前端构建、`server/bridge.py` 校验以及 Rust `cargo check`。
+- **自动发版（`.github/workflows/release.yml`）**：推送 `vX.Y.Z`（或 `vX.Y.Z-rc.1`）格式标签时，自动同步版本号并构建 **macOS (arm64 / x64 `.dmg`)、Linux (`.AppImage` / `.deb`)、Windows (`.msi` / `-setup.exe`)** 预构建包与 `SHA256SUMS.txt`，自动创建或更新对应的 GitHub Release：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+---
+
 ## Roadmap
 
 - [x] T3 Code (`statev2.sqlite`) 只读解析与 Git / 附件抽取

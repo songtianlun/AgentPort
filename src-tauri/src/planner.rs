@@ -169,8 +169,32 @@ pub fn resolve_agent_target(
     (Some(cfg.id.clone()), resolved_model, resolved_mode, warnings)
 }
 
+const EMBEDDED_EXAMPLE_CATALOG: &str = include_str!("../../data/lody-catalog.example.json");
+
 pub fn load_catalog_file(path: &Path) -> Result<LodyCatalog, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("读取 Lody Catalog 失败 ({}): {e}", path.display()))?;
     serde_json::from_str(&raw).map_err(|e| format!("解析 Lody Catalog JSON 失败: {e}"))
+}
+
+pub fn load_catalog_with_fallback(explicit_path: Option<&Path>) -> Result<LodyCatalog, String> {
+    if let Some(p) = explicit_path {
+        return load_catalog_file(p);
+    }
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".agentport/lody-catalog.json"));
+    }
+    candidates.push(Path::new("data/lody-catalog.json").to_path_buf());
+    candidates.push(Path::new("../data/lody-catalog.json").to_path_buf());
+    candidates.push(Path::new("data/lody-catalog.example.json").to_path_buf());
+    candidates.push(Path::new("../data/lody-catalog.example.json").to_path_buf());
+
+    for c in candidates {
+        if c.exists() {
+            return load_catalog_file(&c);
+        }
+    }
+    serde_json::from_str(EMBEDDED_EXAMPLE_CATALOG)
+        .map_err(|e| format!("解析内嵌示例 Lody Catalog 失败: {e}"))
 }
