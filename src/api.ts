@@ -1,0 +1,79 @@
+import type { ExportRequest, ExportResult, LodyCatalog, T3ScanResult, T3ThreadDetail } from './types';
+
+export function isTauriRuntime(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<T>(cmd, args);
+}
+
+async function httpJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return data as T;
+}
+
+export async function getRuntimeInfo(): Promise<{
+  runtime: 'tauri-native' | 'web-bridge';
+  defaultDbPath: string;
+  defaultOutputDir: string;
+}> {
+  if (isTauriRuntime()) {
+    return {
+      runtime: 'tauri-native',
+      defaultDbPath: '~/.t3/userdata/statev2.sqlite',
+      defaultOutputDir: './migration-bundle',
+    };
+  }
+  const h = await httpJson<{
+    runtime: 'web-bridge';
+    defaultDbPath: string;
+    defaultOutputDir: string;
+  }>('/api/health');
+  return h;
+}
+
+export async function scanT3Database(dbPath?: string): Promise<T3ScanResult> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<T3ScanResult>('scan_t3_database', { dbPath: dbPath || null });
+  }
+  const q = dbPath ? `?dbPath=${encodeURIComponent(dbPath)}` : '';
+  return httpJson<T3ScanResult>(`/api/scan${q}`);
+}
+
+export async function getLodyCatalog(): Promise<LodyCatalog> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<LodyCatalog>('get_lody_catalog', { catalogPath: null });
+  }
+  return httpJson<LodyCatalog>('/api/catalog');
+}
+
+export async function getThreadDetail(threadId: string, dbPath?: string): Promise<T3ThreadDetail> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<T3ThreadDetail>('get_thread_detail', {
+      dbPath: dbPath || null,
+      threadId,
+    });
+  }
+  const q = dbPath ? `?dbPath=${encodeURIComponent(dbPath)}` : '';
+  return httpJson<T3ThreadDetail>(`/api/thread/${encodeURIComponent(threadId)}${q}`);
+}
+
+export async function exportMigrationBundle(request: ExportRequest): Promise<ExportResult> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<ExportResult>('export_migration_bundle', {
+      request,
+      catalogPath: null,
+    });
+  }
+  return httpJson<ExportResult>('/api/export', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}

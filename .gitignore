@@ -1,0 +1,18 @@
+# Dependencies & Build artifacts
+node_modules/
+dist/
+tsconfig.tsbuildinfo
+src-tauri/target/
+
+# Local private snapshots & exported bundles
+data/lody-catalog.json
+migration-bundle/
+test-bundle-check/
+
+# Databases & caches
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+__pycache__/
+*.pyc
+.DS_Store

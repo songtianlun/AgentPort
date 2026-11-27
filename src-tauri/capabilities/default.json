@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for T3 Code to Lody Migrator",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

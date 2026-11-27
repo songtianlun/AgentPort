@@ -1,0 +1,55 @@
+{
+  "workspaceId": "example-workspace-id",
+  "defaultMachineId": "machine-local-dev",
+  "machines": [
+    {
+      "id": "machine-local-dev",
+      "name": "local-dev-machine",
+      "onlineStatus": "online"
+    }
+  ],
+  "projects": [
+    {
+      "id": "local-project-example",
+      "name": "my-project",
+      "kind": "local",
+      "machineId": "machine-local-dev",
+      "rootPath": "/path/to/my-project",
+      "repoFullName": null,
+      "available": true
+    },
+    {
+      "id": "owner/my-project",
+      "name": "owner/my-project",
+      "kind": "github",
+      "machineId": null,
+      "rootPath": null,
+      "repoFullName": "owner/my-project",
+      "available": true
+    }
+  ],
+  "agentConfigs": [
+    {
+      "id": "agent-antigravity-example",
+      "name": "Antigravity",
+      "machineId": "machine-local-dev",
+      "agentType": "antigravity",
+      "available": true,
+      "modes": ["default", "accept-edits", "plan"],
+      "models": ["gemini-4-neon", "gemini-4-argon", "claude-sonnet-5-5"],
+      "planMode": true,
+      "fastMode": false
+    },
+    {
+      "id": "agent-codex-example",
+      "name": "Codex",
+      "machineId": "machine-local-dev",
+      "agentType": "codex",
+      "available": true,
+      "modes": ["read-only", "agent", "agent-auto-review", "agent-full-access"],
+      "models": ["gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra"],
+      "planMode": true,
+      "fastMode": true
+    }
+  ]
+}
