@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn load_migration_state(output_dir: &str) -> Vec<MigrationStateRecord> {
     let out_dir = expand_tilde(output_dir);
@@ -275,16 +276,33 @@ pub fn export_bundle(
     })
 }
 
-pub fn import_to_lody(
+pub fn import_to_lody_with_progress<F>(
     db_path: &Path,
     catalog: &LodyCatalog,
     req: &ImportToLodyRequest,
-) -> Result<ImportToLodyResult, String> {
+    cancel_flag: &AtomicBool,
+    mut on_progress: F,
+) -> Result<ImportToLodyResult, String>
+where
+    F: FnMut(ImportProgressEvent),
+{
     let daemon = lody_discovery::find_running_daemon();
     let cli = lody_discovery::find_lody_cli_command(daemon.as_ref()).ok_or_else(|| {
         "未找到本机可用的 Lody CLI（请确认 Lody Desktop 正在运行，或已将 lody 加入 PATH）"
             .to_string()
     })?;
+
+    on_progress(ImportProgressEvent {
+        phase: "exporting".into(),
+        total: req.export_request.selected_thread_ids.len(),
+        processed: 0,
+        imported_now: 0,
+        skipped_already_imported: 0,
+        failed: 0,
+        current_thread_id: None,
+        current_title: Some("正在同步导出归档与附件…".into()),
+        last_outcome: None,
+    });
 
     // Step 1: Ensure bundle & handoff files are up-to-date while preserving prior imported state
     let export_res = export_bundle(db_path, catalog, &req.export_request)?;
@@ -301,14 +319,40 @@ pub fn import_to_lody(
     let state_path = Path::new(&export_res.state_path);
     let mut state_records = load_migration_state(&export_res.output_dir);
 
+    let total_target = if let Some(limit) = req.max_count {
+        let unimported = create_items
+            .iter()
+            .filter(|it| {
+                let tid = it.get("sourceThreadId").and_then(|v| v.as_str()).unwrap_or("");
+                req.force_reimport
+                    || !state_records.iter().any(|r| {
+                        r.source_thread_id == tid
+                            && r.status == "imported"
+                            && r.lody_session_id.is_some()
+                    })
+            })
+            .count();
+        let skipped = create_items.len().saturating_sub(unimported);
+        skipped + unimported.min(limit)
+    } else {
+        create_items.len()
+    };
+
     let mut items_out = Vec::new();
     let mut imported_now = 0usize;
     let mut skipped_already_imported = 0usize;
     let skipped_not_ready = export_res.action_required_count;
     let mut failed = 0usize;
     let mut attempted_creates = 0usize;
+    let mut processed = 0usize;
+    let mut cancelled = false;
 
     for item in &create_items {
+        if cancel_flag.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+
         let tid = item
             .get("sourceThreadId")
             .and_then(|v| v.as_str())
@@ -332,13 +376,26 @@ pub fn import_to_lody(
                 && existing.lody_session_id.is_some()
             {
                 skipped_already_imported += 1;
-                items_out.push(ImportItemOutcome {
-                    source_thread_id: tid,
-                    title,
+                processed += 1;
+                let outcome = ImportItemOutcome {
+                    source_thread_id: tid.clone(),
+                    title: title.clone(),
                     operation_id: op_id,
                     status: "skipped_imported".into(),
                     lody_session_id: existing.lody_session_id.clone(),
                     message: Some("已在历史迁移中导入，自动幂等跳过".into()),
+                };
+                items_out.push(outcome.clone());
+                on_progress(ImportProgressEvent {
+                    phase: "importing".into(),
+                    total: total_target,
+                    processed,
+                    imported_now,
+                    skipped_already_imported,
+                    failed,
+                    current_thread_id: Some(tid),
+                    current_title: Some(title),
+                    last_outcome: Some(outcome),
                 });
                 continue;
             }
@@ -350,6 +407,18 @@ pub fn import_to_lody(
             }
         }
         attempted_creates += 1;
+
+        on_progress(ImportProgressEvent {
+            phase: "importing".into(),
+            total: total_target,
+            processed,
+            imported_now,
+            skipped_already_imported,
+            failed,
+            current_thread_id: Some(tid.clone()),
+            current_title: Some(title.clone()),
+            last_outcome: None,
+        });
 
         let mut args: Vec<String> = vec!["session".into(), "create".into(), "--json".into()];
 
@@ -441,7 +510,7 @@ pub fn import_to_lody(
             args.push(pf.into());
         }
 
-        match lody_discovery::run_lody_cli_json_cmd(&cli, &args) {
+        let outcome = match lody_discovery::run_lody_cli_json_cmd(&cli, &args) {
             Ok(resp) => {
                 let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 let sid = resp
@@ -459,14 +528,14 @@ pub fn import_to_lody(
                         rec.imported_at = Some(now);
                     }
                     let _ = save_migration_state(state_path, &state_records);
-                    items_out.push(ImportItemOutcome {
-                        source_thread_id: tid,
-                        title,
+                    ImportItemOutcome {
+                        source_thread_id: tid.clone(),
+                        title: title.clone(),
                         operation_id: op_id,
                         status: "imported".into(),
                         lody_session_id: sid,
                         message: Some("导入成功".into()),
-                    });
+                    }
                 } else {
                     let err_msg = resp
                         .get("error")
@@ -481,14 +550,14 @@ pub fn import_to_lody(
                         rec.last_error = Some(err_msg.clone());
                     }
                     let _ = save_migration_state(state_path, &state_records);
-                    items_out.push(ImportItemOutcome {
-                        source_thread_id: tid,
-                        title,
+                    ImportItemOutcome {
+                        source_thread_id: tid.clone(),
+                        title: title.clone(),
                         operation_id: op_id,
                         status: "failed".into(),
                         lody_session_id: None,
                         message: Some(err_msg),
-                    });
+                    }
                 }
             }
             Err(err_msg) => {
@@ -498,17 +567,43 @@ pub fn import_to_lody(
                     rec.last_error = Some(err_msg.clone());
                 }
                 let _ = save_migration_state(state_path, &state_records);
-                items_out.push(ImportItemOutcome {
-                    source_thread_id: tid,
-                    title,
+                ImportItemOutcome {
+                    source_thread_id: tid.clone(),
+                    title: title.clone(),
                     operation_id: op_id,
                     status: "failed".into(),
                     lody_session_id: None,
                     message: Some(err_msg),
-                });
+                }
             }
-        }
+        };
+
+        processed += 1;
+        items_out.push(outcome.clone());
+        on_progress(ImportProgressEvent {
+            phase: "importing".into(),
+            total: total_target,
+            processed,
+            imported_now,
+            skipped_already_imported,
+            failed,
+            current_thread_id: Some(tid),
+            current_title: Some(title),
+            last_outcome: Some(outcome),
+        });
     }
+
+    on_progress(ImportProgressEvent {
+        phase: if cancelled { "cancelled".into() } else { "done".into() },
+        total: total_target,
+        processed,
+        imported_now,
+        skipped_already_imported,
+        failed,
+        current_thread_id: None,
+        current_title: None,
+        last_outcome: None,
+    });
 
     Ok(ImportToLodyResult {
         output_dir: export_res.output_dir,
@@ -518,6 +613,7 @@ pub fn import_to_lody(
         skipped_already_imported,
         skipped_not_ready,
         failed,
+        cancelled,
         items: items_out,
         state_records,
     })

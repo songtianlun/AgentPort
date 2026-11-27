@@ -288,6 +288,52 @@ fn detect_local_agent_configs(data_dir: &Path, machine_id: &str) -> Vec<LodyAgen
     configs
 }
 
+const SAFE_DAEMON_ENV_KEYS: &[&str] = &[
+    "LODY_PLATFORM",
+    "LODY_AUTH_URL",
+    "LODY_AUTH_SITE_URL",
+    "LODY_SERVER_URL",
+    "LODY_ENV",
+    "LODY_DATA_DIR",
+    "LODY_LORO_STREAMS_WS_ENABLED",
+];
+
+fn default_lody_cloud_env(existing: &mut Vec<(String, String)>) {
+    let defaults = [
+        ("LODY_PLATFORM", "cloud"),
+        ("LODY_AUTH_URL", "https://convex.lody.ai"),
+        ("LODY_AUTH_SITE_URL", "https://backend.lody.ai"),
+        ("LODY_SERVER_URL", "https://api.lody.ai"),
+    ];
+    for (k, v) in defaults {
+        let already_in_extra = existing.iter().any(|(ek, _)| ek == k);
+        let already_in_proc = std::env::var(k).map(|s| !s.trim().is_empty()).unwrap_or(false);
+        if !already_in_extra && !already_in_proc {
+            existing.push((k.to_string(), v.to_string()));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_safe_daemon_env(pid: u64) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(raw) = fs::read(format!("/proc/{pid}/environ")) else {
+        return out;
+    };
+    for chunk in raw.split(|&b| b == 0) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(chunk);
+        if let Some((k, v)) = s.split_once('=') {
+            if SAFE_DAEMON_ENV_KEYS.contains(&k) && !v.is_empty() {
+                out.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "linux")]
 fn discover_bundled_cli_from_pid(pid: u64) -> Option<LodyCliCommand> {
     let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
@@ -308,10 +354,13 @@ fn discover_bundled_cli_from_pid(pid: u64) -> Option<LodyCliCommand> {
     if !exe.exists() || !Path::new(&cli_js).exists() {
         return None;
     }
+    let mut extra_env = vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())];
+    extra_env.extend(read_safe_daemon_env(pid));
+    default_lody_cloud_env(&mut extra_env);
     Some(LodyCliCommand {
         program: exe,
         prefix_args: vec![cli_js],
-        extra_env: vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())],
+        extra_env,
     })
 }
 
@@ -325,10 +374,12 @@ fn discover_bundled_cli_from_pid(_pid: u64) -> Option<LodyCliCommand> {
             "/Applications/Lody.app/Contents/Resources/app.asar.unpacked/resources/cli/index.js",
         );
         if app_exe.exists() && cli_js.exists() {
+            let mut extra_env = vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())];
+            default_lody_cloud_env(&mut extra_env);
             return Some(LodyCliCommand {
                 program: app_exe,
                 prefix_args: vec![cli_js.display().to_string()],
-                extra_env: vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())],
+                extra_env,
             });
         }
     }
@@ -336,6 +387,13 @@ fn discover_bundled_cli_from_pid(_pid: u64) -> Option<LodyCliCommand> {
 }
 
 pub fn find_lody_cli_command(daemon: Option<&DaemonRunInfo>) -> Option<LodyCliCommand> {
+    let mut inherited_env = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = daemon.and_then(|d| d.pid) {
+        inherited_env.extend(read_safe_daemon_env(pid));
+    }
+    default_lody_cloud_env(&mut inherited_env);
+
     if let Ok(out) = Command::new("which").arg("lody").output() {
         if out.status.success() {
             let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
@@ -343,7 +401,7 @@ pub fn find_lody_cli_command(daemon: Option<&DaemonRunInfo>) -> Option<LodyCliCo
                 return Some(LodyCliCommand {
                     program: p,
                     prefix_args: vec![],
-                    extra_env: vec![],
+                    extra_env: inherited_env,
                 });
             }
         }
@@ -359,7 +417,7 @@ pub fn find_lody_cli_command(daemon: Option<&DaemonRunInfo>) -> Option<LodyCliCo
                 return Some(LodyCliCommand {
                     program: cand,
                     prefix_args: vec![],
-                    extra_env: vec![],
+                    extra_env: inherited_env,
                 });
             }
         }
@@ -400,14 +458,31 @@ pub fn run_lody_cli_json_cmd(cli: &LodyCliCommand, args: &[String]) -> Result<Va
             detail.chars().take(500).collect::<String>()
         ));
     }
-    let start = stdout
-        .find('{')
-        .ok_or_else(|| format!("Lody CLI 未返回 JSON 输出: {}", stdout.chars().take(300).collect::<String>()))?;
-    serde_json::Deserializer::from_str(&stdout[start..])
-        .into_iter::<Value>()
-        .next()
-        .ok_or_else(|| "解析 Lody CLI JSON 输出为空".to_string())?
-        .map_err(|e| format!("解析 Lody CLI JSON 失败: {e}"))
+
+    // Parse all candidate JSON objects in stdout (Lody CLI may print log lines before JSON)
+    let mut first_valid: Option<Value> = None;
+    for (idx, ch) in stdout.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        if let Some(Ok(val)) = serde_json::Deserializer::from_str(&stdout[idx..])
+            .into_iter::<Value>()
+            .next()
+        {
+            if val.get("ok").is_some() || val.get("sessionId").is_some() || val.get("items").is_some() {
+                return Ok(val);
+            }
+            if first_valid.is_none() {
+                first_valid = Some(val);
+            }
+        }
+    }
+    first_valid.ok_or_else(|| {
+        format!(
+            "Lody CLI 未返回有效 JSON 输出: {}",
+            stdout.chars().take(300).collect::<String>()
+        )
+    })
 }
 
 fn run_lody_cli_json(cli: &LodyCliCommand, args: &[&str]) -> Option<Value> {
@@ -515,10 +590,13 @@ pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
     let mut agent_configs = detect_local_agent_configs(&daemon.data_dir, &machine_id);
     let mut source = "lody-daemon-ipc".to_string();
 
-    // Optional enrichment from `lody` CLI or running Lody Desktop's bundled CLI (adds GitHub repos, other machines, exact agentConfigIds)
+    // Optional enrichment from `lody` CLI or running Lody Desktop's bundled CLI (use --offline to avoid blocking on network sync)
     if let Some(cli_cmd) = find_lody_cli_command(Some(&daemon)) {
         let mut enriched = false;
-        if let Some(m_json) = run_lody_cli_json(&cli_cmd, &["machine", "list", "--json", "--all-pages"]) {
+        if let Some(m_json) = run_lody_cli_json(
+            &cli_cmd,
+            &["machine", "list", "--offline", "--json", "--all-pages"],
+        ) {
             if let Some(items) = m_json.get("items").and_then(|v| v.as_array()) {
                 let mut cli_machines = Vec::new();
                 for m in items {
@@ -543,9 +621,10 @@ pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
                 }
             }
         }
-        if let Some(p_json) =
-            run_lody_cli_json(&cli_cmd, &["project", "list", "--catalog", "--json", "--all-pages"])
-        {
+        if let Some(p_json) = run_lody_cli_json(
+            &cli_cmd,
+            &["project", "list", "--catalog", "--offline", "--json", "--all-pages"],
+        ) {
             if let Some(items) = p_json.get("items").and_then(|v| v.as_array()) {
                 let mut existing_ids: HashSet<String> = projects.iter().map(|p| p.id.clone()).collect();
                 for p in items {
@@ -573,9 +652,10 @@ pub fn discover_live_lody_catalog() -> Result<LodyCatalog, String> {
                 enriched = true;
             }
         }
-        if let Some(a_json) =
-            run_lody_cli_json(&cli_cmd, &["agent-config", "list", "--json", "--all-pages"])
-        {
+        if let Some(a_json) = run_lody_cli_json(
+            &cli_cmd,
+            &["agent-config", "list", "--offline", "--json", "--all-pages"],
+        ) {
             if let Some(items) = a_json.get("items").and_then(|v| v.as_array()) {
                 let mut cli_agents = Vec::new();
                 for a in items {

@@ -244,6 +244,20 @@ pub struct ImportItemOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImportProgressEvent {
+    pub phase: String, // "exporting" | "importing" | "done" | "cancelled"
+    pub total: usize,
+    pub processed: usize,
+    pub imported_now: usize,
+    pub skipped_already_imported: usize,
+    pub failed: usize,
+    pub current_thread_id: Option<String>,
+    pub current_title: Option<String>,
+    pub last_outcome: Option<ImportItemOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportToLodyResult {
     pub output_dir: String,
     pub state_path: String,
@@ -252,6 +266,8 @@ pub struct ImportToLodyResult {
     pub skipped_already_imported: usize,
     pub skipped_not_ready: usize,
     pub failed: usize,
+    #[serde(default)]
+    pub cancelled: bool,
     pub items: Vec<ImportItemOutcome>,
     pub state_records: Vec<MigrationStateRecord>,
 }

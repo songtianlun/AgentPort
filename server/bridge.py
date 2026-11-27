@@ -166,10 +166,47 @@ def _detect_local_agents(data_dir: Path, machine_id: str) -> list[dict[str, Any]
     return res
 
 
+SAFE_DAEMON_ENV_KEYS = {
+    "LODY_PLATFORM",
+    "LODY_AUTH_URL",
+    "LODY_AUTH_SITE_URL",
+    "LODY_SERVER_URL",
+    "LODY_ENV",
+    "LODY_DATA_DIR",
+    "LODY_LORO_STREAMS_WS_ENABLED",
+}
+
+
+def _collect_lody_cli_env(daemon: dict[str, Any] | None) -> dict[str, str]:
+    extra: dict[str, str] = {}
+    if daemon and daemon.get("pid"):
+        env_p = Path(f"/proc/{daemon['pid']}/environ")
+        if env_p.exists():
+            try:
+                for item in env_p.read_bytes().split(b"\x00"):
+                    if not item:
+                        continue
+                    k, _, v = item.decode("utf-8", errors="replace").partition("=")
+                    if k in SAFE_DAEMON_ENV_KEYS and v:
+                        extra[k] = v
+            except Exception:
+                pass
+    for k, v in (
+        ("LODY_PLATFORM", "cloud"),
+        ("LODY_AUTH_URL", "https://convex.lody.ai"),
+        ("LODY_AUTH_SITE_URL", "https://backend.lody.ai"),
+        ("LODY_SERVER_URL", "https://api.lody.ai"),
+    ):
+        if k not in extra and not os.environ.get(k):
+            extra[k] = v
+    return extra
+
+
 def _find_lody_cli_command(daemon: dict[str, Any] | None) -> tuple[list[str], dict[str, str]] | None:
+    inherited = _collect_lody_cli_env(daemon)
     which_lody = shutil.which("lody")
     if which_lody:
-        return [which_lody], {}
+        return [which_lody], inherited
     for cand in [
         Path.home() / ".local" / "bin" / "lody",
         Path.home() / ".lody" / "daemon-managed" / "service",
@@ -177,7 +214,7 @@ def _find_lody_cli_command(daemon: dict[str, Any] | None) -> tuple[list[str], di
         Path("/opt/homebrew/bin/lody"),
     ]:
         if cand.exists():
-            return [str(cand)], {}
+            return [str(cand)], inherited
     if daemon and daemon.get("pid"):
         proc_cmd = Path(f"/proc/{daemon['pid']}/cmdline")
         if proc_cmd.exists():
@@ -185,7 +222,7 @@ def _find_lody_cli_command(daemon: dict[str, Any] | None) -> tuple[list[str], di
                 parts = [p.decode("utf-8", errors="replace") for p in proc_cmd.read_bytes().split(b"\x00") if p]
                 cli_js = next((a for a in parts[1:] if a.endswith("cli/index.js")), None)
                 if parts and cli_js and Path(parts[0]).exists() and Path(cli_js).exists():
-                    return [parts[0], cli_js], {"ELECTRON_RUN_AS_NODE": "1"}
+                    return [parts[0], cli_js], {**inherited, "ELECTRON_RUN_AS_NODE": "1"}
             except Exception:
                 pass
     return None
@@ -198,11 +235,26 @@ def _run_lody_cli_json(cli: tuple[list[str], dict[str, str]], args: list[str]) -
     if r.returncode != 0:
         detail = (r.stderr.strip() or r.stdout.strip())[:500]
         raise RuntimeError(f"Lody CLI 执行失败 (exit {r.returncode}): {detail}")
-    idx = r.stdout.find("{")
-    if idx < 0:
-        raise RuntimeError(f"Lody CLI 未返回 JSON: {r.stdout[:300]}")
-    obj, _ = json.JSONDecoder().raw_decode(r.stdout, idx)
-    return obj
+    decoder = json.JSONDecoder()
+    first_valid: dict[str, Any] | None = None
+    pos = 0
+    while True:
+        idx = r.stdout.find("{", pos)
+        if idx < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(r.stdout, idx)
+            if isinstance(obj, dict):
+                if any(k in obj for k in ("ok", "sessionId", "items")):
+                    return obj
+                if first_valid is None:
+                    first_valid = obj
+            pos = end
+        except Exception:
+            pos = idx + 1
+    if first_valid is not None:
+        return first_valid
+    raise RuntimeError(f"Lody CLI 未返回有效 JSON: {r.stdout[:300]}")
 
 
 def _discover_live_catalog() -> dict[str, Any] | None:
@@ -248,7 +300,9 @@ def _discover_live_catalog() -> dict[str, Any] | None:
         cli = _find_lody_cli_command(daemon)
         if cli:
             try:
-                a_json = _run_lody_cli_json(cli, ["agent-config", "list", "--json", "--all-pages"])
+                a_json = _run_lody_cli_json(
+                    cli, ["agent-config", "list", "--offline", "--json", "--all-pages"]
+                )
                 cli_agents = []
                 for a in a_json.get("items") or []:
                     rc = a.get("runConfig") or {}

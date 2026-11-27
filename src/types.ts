@@ -217,6 +217,18 @@ export interface ImportItemOutcome {
   message?: string | null;
 }
 
+export interface ImportProgressEvent {
+  phase: 'exporting' | 'importing' | 'done' | 'cancelled' | string;
+  total: number;
+  processed: number;
+  importedNow: number;
+  skippedAlreadyImported: number;
+  failed: number;
+  currentThreadId?: string | null;
+  currentTitle?: string | null;
+  lastOutcome?: ImportItemOutcome | null;
+}
+
 export interface ImportToLodyResult {
   outputDir: string;
   statePath: string;
@@ -225,6 +237,7 @@ export interface ImportToLodyResult {
   skippedAlreadyImported: number;
   skippedNotReady: number;
   failed: number;
+  cancelled?: boolean;
   items: ImportItemOutcome[];
   stateRecords: MigrationStateRecord[];
 }

@@ -7,12 +7,21 @@ import {
   History,
   RefreshCw,
   Rocket,
+  Square,
   XCircle,
 } from 'lucide-react';
-import { exportMigrationBundle, importToLody, readMigrationState } from '../api';
+import {
+  cancelLodyImport,
+  exportMigrationBundle,
+  importToLody,
+  readMigrationState,
+  subscribeImportProgress,
+} from '../api';
 import type {
   AgentMappingOverride,
   ExportResult,
+  ImportItemOutcome,
+  ImportProgressEvent,
   ImportToLodyResult,
   MigrationStateRecord,
   ProjectMappingOverride,
@@ -44,9 +53,12 @@ export const ExportTab: React.FC<Props> = ({
   const [outputDir, setOutputDir] = useState(defaultOutputDir);
   const [includeArchived, setIncludeArchived] = useState(false);
   const [busyMode, setBusyMode] = useState<null | 'export' | 'import_one' | 'import_all'>(null);
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [importResult, setImportResult] = useState<ImportToLodyResult | null>(null);
+  const [liveProgress, setLiveProgress] = useState<ImportProgressEvent | null>(null);
+  const [liveItems, setLiveItems] = useState<ImportItemOutcome[]>([]);
   const [stateRecords, setStateRecords] = useState<MigrationStateRecord[]>([]);
 
   const loadState = async (dir = outputDir) => {
@@ -62,6 +74,34 @@ export const ExportTab: React.FC<Props> = ({
     loadState(outputDir);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputDir]);
+
+  useEffect(() => {
+    let cleanup: (() => void) | null = null;
+    let disposed = false;
+    subscribeImportProgress((ev) => {
+      if (disposed) return;
+      setLiveProgress(ev);
+      if (ev.lastOutcome) {
+        const outcome = ev.lastOutcome;
+        setLiveItems((prev) => {
+          const idx = prev.findIndex((x) => x.sourceThreadId === outcome.sourceThreadId);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = outcome;
+            return next;
+          }
+          return [outcome, ...prev];
+        });
+      }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else cleanup = unlisten;
+    });
+    return () => {
+      disposed = true;
+      if (cleanup) cleanup();
+    };
+  }, []);
 
   const selectedThreads = scan.threads.filter((t) => selectedIds.has(t.id));
   const readyCount = selectedThreads.filter((t) => {
@@ -103,7 +143,19 @@ export const ExportTab: React.FC<Props> = ({
 
   const handleImport = async (maxCount: number | null) => {
     setBusyMode(maxCount === 1 ? 'import_one' : 'import_all');
+    setCancelling(false);
     setError(null);
+    setImportResult(null);
+    setLiveItems([]);
+    setLiveProgress({
+      phase: 'exporting',
+      total: maxCount === 1 ? Math.min(1, remainingToImport) : readyCount,
+      processed: 0,
+      importedNow: 0,
+      skippedAlreadyImported: 0,
+      failed: 0,
+      currentTitle: '正在准备归档文件…',
+    });
     try {
       const res = await importToLody({
         exportRequest: buildExportReq(),
@@ -111,16 +163,30 @@ export const ExportTab: React.FC<Props> = ({
         forceReimport: false,
       });
       setImportResult(res);
+      setLiveItems(res.items);
       setStateRecords(res.stateRecords);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      await loadState(outputDir);
     } finally {
       setBusyMode(null);
+      setCancelling(false);
     }
+  };
+
+  const handleCancel = async () => {
+    setCancelling(true);
+    await cancelLodyImport();
   };
 
   const totalImportedCount = stateRecords.filter((r) => r.status === 'imported').length;
   const totalFailedCount = stateRecords.filter((r) => r.status === 'failed').length;
+  const isImporting = busyMode === 'import_one' || busyMode === 'import_all';
+  const progressPct =
+    liveProgress && liveProgress.total > 0
+      ? Math.min(100, Math.round((liveProgress.processed / liveProgress.total) * 100))
+      : 0;
+  const displayItems = importResult ? importResult.items : liveItems;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -132,11 +198,11 @@ export const ExportTab: React.FC<Props> = ({
               一键幂等导入到 Lody
             </h2>
             <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 2 }}>
-              自动同步导出完整归档（<code>transcript.md</code>、<code>dirty.patch</code>、原始附件）并逐条导入本机 Lody；已导入会话基于{' '}
-              <code>migration-state.json</code> 自动跳过，支持随时中断续跑。
+              后台异步执行不阻塞界面；自动导出归档（<code>transcript.md</code>、<code>dirty.patch</code>、原始附件）并逐条导入本机 Lody，已导入会话基于{' '}
+              <code>migration-state.json</code> 自动跳过，支持随时停止与续跑。
             </div>
           </div>
-          <span className="pill pill-green">幂等防重复</span>
+          <span className="pill pill-green">异步 · 幂等防重复</span>
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -148,6 +214,7 @@ export const ExportTab: React.FC<Props> = ({
               className="input mono"
               style={{ width: '100%' }}
               value={outputDir}
+              disabled={isImporting}
               onChange={(e) => setOutputDir(e.target.value)}
             />
           </div>
@@ -157,6 +224,7 @@ export const ExportTab: React.FC<Props> = ({
               <input
                 type="checkbox"
                 checked={includeArchived}
+                disabled={isImporting}
                 onChange={(e) => setIncludeArchived(e.target.checked)}
               />
               同时包含已归档会话
@@ -177,7 +245,7 @@ export const ExportTab: React.FC<Props> = ({
             >
               <Rocket size={14} />
               {busyMode === 'import_all'
-                ? '正在一键幂等导入到 Lody…'
+                ? '后台导入执行中…'
                 : `一键幂等导入 Lody（待新建 ${remainingToImport} 条）`}
             </button>
 
@@ -198,67 +266,123 @@ export const ExportTab: React.FC<Props> = ({
               <Download size={14} />
               {busyMode === 'export' ? '正在导出归档…' : '仅导出迁移包'}
             </button>
+
+            {isImporting && (
+              <button className="btn btn-danger" disabled={cancelling} onClick={handleCancel}>
+                <Square size={12} />
+                {cancelling ? '正在安全停止（当前条完成后中止）…' : '停止导入'}
+              </button>
+            )}
           </div>
         </div>
 
-        {busyMode && busyMode !== 'export' && (
-          <div className="warn-box" style={{ marginTop: 12 }}>
-            正在通过本机 Lody CLI 逐条创建会话、挂载归档附件并写入 <code>migration-state.json</code>
-            ，每完成一条即实时落盘，请耐心等待本批结束…
+        {isImporting && liveProgress && (
+          <div
+            style={{
+              marginTop: 14,
+              padding: '12px 14px',
+              borderRadius: 10,
+              background: '#0d121d',
+              border: '1px solid var(--border)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                {liveProgress.phase === 'exporting'
+                  ? '阶段 1/2：同步导出归档与附件…'
+                  : `阶段 2/2：导入进度 ${liveProgress.processed} / ${liveProgress.total}（${progressPct}%）`}
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                <span className="pill pill-green">新导入 {liveProgress.importedNow}</span>
+                <span className="pill pill-blue">跳过 {liveProgress.skippedAlreadyImported}</span>
+                {liveProgress.failed > 0 && (
+                  <span className="pill pill-red">失败 {liveProgress.failed}</span>
+                )}
+              </div>
+            </div>
+            <div className="progress-track">
+              <div className="progress-fill" style={{ width: `${progressPct}%` }} />
+            </div>
+            {liveProgress.currentTitle && (
+              <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                当前处理：<span style={{ color: 'var(--text)' }}>{liveProgress.currentTitle}</span>
+              </div>
+            )}
           </div>
         )}
 
         {error && <div className="err-box">{error}</div>}
       </div>
 
-      {importResult && (
+      {(importResult || (isImporting && displayItems.length > 0)) && (
         <div
           className="card"
           style={{
             borderColor:
-              importResult.failed === 0
+              importResult?.failed === 0 && !importResult?.cancelled
                 ? 'rgba(16, 185, 129, 0.35)'
                 : 'rgba(245, 158, 11, 0.35)',
           }}
         >
           <div className="card-header">
-            <h3 className="card-title" style={{ color: importResult.failed === 0 ? '#34d399' : '#fbbf24' }}>
-              <CheckCircle2 size={16} /> 本次 Lody 幂等导入执行完成
+            <h3
+              className="card-title"
+              style={{
+                color: isImporting
+                  ? '#60a5fa'
+                  : importResult?.cancelled
+                    ? '#fbbf24'
+                    : importResult?.failed === 0
+                      ? '#34d399'
+                      : '#fbbf24',
+              }}
+            >
+              <CheckCircle2 size={16} />
+              {isImporting
+                ? '实时导入日志'
+                : importResult?.cancelled
+                  ? '导入已手动停止（已完成项已持久化保存）'
+                  : '本次 Lody 幂等导入执行完成'}
             </h3>
-            <span className="pill pill-blue">状态已持久化</span>
+            <span className="pill pill-blue">逐条实时落盘</span>
           </div>
 
-          <div className="grid-4" style={{ marginBottom: 14 }}>
-            <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
-              <div className="stat-label">本次新导入</div>
-              <div className="stat-value" style={{ fontSize: 22, color: '#34d399' }}>
-                {importResult.importedNow}
+          {importResult && (
+            <div className="grid-4" style={{ marginBottom: 14 }}>
+              <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
+                <div className="stat-label">本次新导入</div>
+                <div className="stat-value" style={{ fontSize: 22, color: '#34d399' }}>
+                  {importResult.importedNow}
+                </div>
+              </div>
+              <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
+                <div className="stat-label">已存在幂等跳过</div>
+                <div className="stat-value" style={{ fontSize: 22, color: '#60a5fa' }}>
+                  {importResult.skippedAlreadyImported}
+                </div>
+              </div>
+              <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
+                <div className="stat-label">需先注册跳过</div>
+                <div className="stat-value" style={{ fontSize: 22, color: '#fbbf24' }}>
+                  {importResult.skippedNotReady}
+                </div>
+              </div>
+              <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
+                <div className="stat-label">失败（可重试）</div>
+                <div
+                  className="stat-value"
+                  style={{ fontSize: 22, color: importResult.failed > 0 ? '#fb7185' : 'var(--muted)' }}
+                >
+                  {importResult.failed}
+                </div>
               </div>
             </div>
-            <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
-              <div className="stat-label">已存在幂等跳过</div>
-              <div className="stat-value" style={{ fontSize: 22, color: '#60a5fa' }}>
-                {importResult.skippedAlreadyImported}
-              </div>
-            </div>
-            <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
-              <div className="stat-label">需先注册跳过</div>
-              <div className="stat-value" style={{ fontSize: 22, color: '#fbbf24' }}>
-                {importResult.skippedNotReady}
-              </div>
-            </div>
-            <div style={{ background: '#0d121d', padding: 12, borderRadius: 9 }}>
-              <div className="stat-label">失败（可重试）</div>
-              <div
-                className="stat-value"
-                style={{ fontSize: 22, color: importResult.failed > 0 ? '#fb7185' : 'var(--muted)' }}
-              >
-                {importResult.failed}
-              </div>
-            </div>
-          </div>
+          )}
 
-          {importResult.items.length > 0 && (
+          {displayItems.length > 0 && (
             <div className="table-wrap" style={{ maxHeight: 260, overflowY: 'auto' }}>
               <table>
                 <thead>
@@ -270,7 +394,7 @@ export const ExportTab: React.FC<Props> = ({
                   </tr>
                 </thead>
                 <tbody>
-                  {importResult.items.map((it) => (
+                  {displayItems.map((it) => (
                     <tr key={it.sourceThreadId}>
                       <td style={{ maxWidth: 320, wordBreak: 'break-word' }}>{it.title}</td>
                       <td>
@@ -287,7 +411,9 @@ export const ExportTab: React.FC<Props> = ({
                       <td className="mono" style={{ fontSize: 11.5 }}>
                         {it.lodySessionId || '-'}
                       </td>
-                      <td style={{ fontSize: 12, color: 'var(--muted)' }}>{it.message || '-'}</td>
+                      <td style={{ fontSize: 12, color: it.status === 'failed' ? '#fda4af' : 'var(--muted)' }}>
+                        {it.message || '-'}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -297,7 +423,7 @@ export const ExportTab: React.FC<Props> = ({
         </div>
       )}
 
-      {exportResult && !importResult && (
+      {exportResult && !importResult && !isImporting && (
         <div className="card" style={{ borderColor: 'rgba(16, 185, 129, 0.35)' }}>
           <div className="card-header">
             <h3 className="card-title" style={{ color: '#34d399' }}>
@@ -326,7 +452,7 @@ export const ExportTab: React.FC<Props> = ({
               {totalFailedCount > 0 ? ` · 失败 ${totalFailedCount} 条（可再次点击一键导入重试）` : ''}
             </div>
           </div>
-          <button className="btn" onClick={() => loadState(outputDir)}>
+          <button className="btn" disabled={isImporting} onClick={() => loadState(outputDir)}>
             <RefreshCw size={12} /> 刷新状态
           </button>
         </div>

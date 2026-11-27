@@ -1,6 +1,7 @@
 import type {
   ExportRequest,
   ExportResult,
+  ImportProgressEvent,
   ImportToLodyRequest,
   ImportToLodyResult,
   LodyCatalog,
@@ -126,4 +127,24 @@ export async function importToLody(request: ImportToLodyRequest): Promise<Import
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
   });
+}
+
+export async function cancelLodyImport(): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<boolean>('cancel_lody_import');
+  }
+  return false;
+}
+
+export async function subscribeImportProgress(
+  handler: (event: ImportProgressEvent) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<ImportProgressEvent>('lody-import-progress', (ev) => {
+    handler(ev.payload);
+  });
+  return unlisten;
 }
