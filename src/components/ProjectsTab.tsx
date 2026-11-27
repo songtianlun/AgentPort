@@ -1,5 +1,13 @@
-import React from 'react';
-import { CheckCircle2, FolderGit2, GitBranch, RotateCcw, AlertTriangle, XCircle } from 'lucide-react';
+import React, { useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  FolderGit2,
+  FolderPlus,
+  GitBranch,
+  RotateCcw,
+  XCircle,
+} from 'lucide-react';
 import type { LodyCatalog, ProjectMappingOverride, ResolvedProjectMapping } from '../types';
 
 interface Props {
@@ -7,6 +15,7 @@ interface Props {
   catalog: LodyCatalog;
   targetMachineId: string;
   overrides: Record<string, ProjectMappingOverride>;
+  onRegisterProject?: (projectId: string, rootPath: string) => Promise<void>;
   onOverrideChange: (projectId: string, override: ProjectMappingOverride | null) => void;
 }
 
@@ -15,12 +24,36 @@ export const ProjectsTab: React.FC<Props> = ({
   catalog,
   targetMachineId,
   overrides,
+  onRegisterProject,
   onOverrideChange,
 }) => {
+  const [registeringId, setRegisteringId] = useState<string | null>(null);
+  const [regError, setRegError] = useState<Record<string, string>>({});
+
   const localProjects = catalog.projects.filter(
     (p) => p.kind === 'local' && p.machineId === targetMachineId
   );
   const githubProjects = catalog.projects.filter((p) => p.kind === 'github');
+
+  const handleRegister = async (projectId: string, rootPath: string) => {
+    if (!onRegisterProject) return;
+    setRegisteringId(projectId);
+    setRegError((prev) => {
+      const next = { ...prev };
+      delete next[projectId];
+      return next;
+    });
+    try {
+      await onRegisterProject(projectId, rootPath);
+    } catch (e) {
+      setRegError((prev) => ({
+        ...prev,
+        [projectId]: e instanceof Error ? e.message : String(e),
+      }));
+    } finally {
+      setRegisteringId(null);
+    }
+  };
 
   const encodeValue = (m: ResolvedProjectMapping) => {
     const ov = overrides[m.project.id];
@@ -166,7 +199,31 @@ export const ProjectsTab: React.FC<Props> = ({
                       key={idx}
                       className={m.status === 'action_required' ? 'err-box' : 'warn-box'}
                     >
-                      {w}
+                      <div>{w}</div>
+                      {m.status === 'action_required' &&
+                        catalog.daemonConnected &&
+                        targetMachineId === catalog.defaultMachineId &&
+                        m.project.git.exists &&
+                        onRegisterProject && (
+                          <div style={{ marginTop: 8 }}>
+                            <button
+                              className="btn btn-primary"
+                              style={{ padding: '4px 10px', fontSize: 12 }}
+                              disabled={registeringId === m.project.id}
+                              onClick={() => handleRegister(m.project.id, m.project.workspaceRoot)}
+                            >
+                              <FolderPlus size={13} />
+                              {registeringId === m.project.id
+                                ? '正在向 Lody 注册…'
+                                : '一键添加到本机 Lody'}
+                            </button>
+                          </div>
+                        )}
+                      {regError[m.project.id] && (
+                        <div style={{ marginTop: 6, color: '#fda4af' }}>
+                          注册失败：{regError[m.project.id]}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </td>

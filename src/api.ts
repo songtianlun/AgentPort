@@ -1,4 +1,11 @@
-import type { ExportRequest, ExportResult, LodyCatalog, T3ScanResult, T3ThreadDetail } from './types';
+import type {
+  ExportRequest,
+  ExportResult,
+  LodyCatalog,
+  LodyProject,
+  T3ScanResult,
+  T3ThreadDetail,
+} from './types';
 
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -62,6 +69,23 @@ export async function getThreadDetail(threadId: string, dbPath?: string): Promis
   }
   const q = dbPath ? `?dbPath=${encodeURIComponent(dbPath)}` : '';
   return httpJson<T3ThreadDetail>(`/api/thread/${encodeURIComponent(threadId)}${q}`);
+}
+
+export async function registerLodyLocalProject(
+  rootPath: string,
+  workspaceId?: string
+): Promise<LodyProject> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<LodyProject>('register_lody_local_project', {
+      rootPath,
+      workspaceId: workspaceId || null,
+    });
+  }
+  return httpJson<LodyProject>('/api/lody/register-project', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rootPath, workspaceId }),
+  });
 }
 
 export async function exportMigrationBundle(request: ExportRequest): Promise<ExportResult> {

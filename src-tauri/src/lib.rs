@@ -1,4 +1,5 @@
 mod exporter;
+mod lody_discovery;
 mod models;
 mod planner;
 mod t3_reader;
@@ -50,6 +51,14 @@ fn export_migration_bundle(
     exporter::export_bundle(&db, &catalog, &request)
 }
 
+#[tauri::command]
+fn register_lody_local_project(
+    root_path: String,
+    workspace_id: Option<String>,
+) -> Result<LodyProject, String> {
+    lody_discovery::register_local_project(&root_path, workspace_id.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -58,6 +67,7 @@ pub fn run() {
             scan_t3_database,
             get_thread_detail,
             get_lody_catalog,
+            register_lody_local_project,
             export_migration_bundle
         ])
         .run(tauri::generate_context!())

@@ -8,6 +8,12 @@ import type {
   T3ThreadSummary,
 } from './types';
 
+function normalizePath(p: string | null | undefined): string {
+  if (!p) return '';
+  const trimmed = p.trim().replace(/[\\/]+$/, '');
+  return trimmed || p.trim();
+}
+
 export function resolveProjectMapping(
   project: T3Project,
   catalog: LodyCatalog,
@@ -65,12 +71,13 @@ export function resolveProjectMapping(
     };
   }
 
-  // 1. Exact local path match
+  // 1. Exact local path match (normalized trailing slashes)
+  const targetRootNorm = normalizePath(project.workspaceRoot);
   const localMatch = catalog.projects.find(
     (p) =>
       p.kind === 'local' &&
       p.machineId === targetMachineId &&
-      p.rootPath === project.workspaceRoot
+      normalizePath(p.rootPath) === targetRootNorm
   );
   if (localMatch) {
     return {

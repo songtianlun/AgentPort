@@ -1,9 +1,22 @@
+use crate::lody_discovery;
 use crate::models::*;
 use crate::t3_reader::expand_tilde;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+
+fn normalize_path_str(p: &str) -> String {
+    let expanded = expand_tilde(p);
+    let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+    let s = canonical.display().to_string();
+    let trimmed = s.trim_end_matches(|c| c == '/' || c == '\\');
+    if trimmed.is_empty() {
+        s
+    } else {
+        trimmed.to_string()
+    }
+}
 
 pub fn deterministic_op_id(thread_id: &str) -> String {
     let mut hasher = Sha256::new();
@@ -39,11 +52,16 @@ pub fn resolve_project_target(
         return ("exact".into(), json!({ "kind": "chat" }), vec![]);
     }
 
-    // 1. Exact local path match on target machine
+    // 1. Exact local path match on target machine (normalized & symlink-aware)
+    let target_root_norm = normalize_path_str(&project.workspace_root);
     if let Some(lp) = catalog.projects.iter().find(|lp| {
         lp.kind == "local"
             && lp.machine_id.as_deref() == Some(target_machine_id)
-            && lp.root_path.as_deref() == Some(project.workspace_root.as_str())
+            && lp
+                .root_path
+                .as_deref()
+                .map(|r| normalize_path_str(r) == target_root_norm)
+                .unwrap_or(false)
     }) {
         return (
             "exact".into(),
@@ -178,24 +196,54 @@ pub fn load_catalog_file(path: &Path) -> Result<LodyCatalog, String> {
     serde_json::from_str(&raw).map_err(|e| format!("解析 Lody Catalog JSON 失败: {e}"))
 }
 
-pub fn load_catalog_with_fallback(explicit_path: Option<&str>) -> Result<LodyCatalog, String> {
-    if let Some(p) = explicit_path.map(str::trim).filter(|s| !s.is_empty()) {
-        return load_catalog_file(&expand_tilde(p));
-    }
+fn load_file_catalog_if_exists() -> Option<(LodyCatalog, String)> {
     let mut candidates = Vec::new();
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".agentport/lody-catalog.json"));
     }
     candidates.push(Path::new("data/lody-catalog.json").to_path_buf());
     candidates.push(Path::new("../data/lody-catalog.json").to_path_buf());
-    candidates.push(Path::new("data/lody-catalog.example.json").to_path_buf());
-    candidates.push(Path::new("../data/lody-catalog.example.json").to_path_buf());
 
     for c in candidates {
         if c.exists() {
-            return load_catalog_file(&c);
+            if let Ok(mut cat) = load_catalog_file(&c) {
+                let label = c.display().to_string();
+                cat.source = Some("local-file".to_string());
+                cat.source_detail = Some(format!("从本地快照加载: {label}"));
+                return Some((cat, label));
+            }
         }
     }
-    serde_json::from_str(EMBEDDED_EXAMPLE_CATALOG)
-        .map_err(|e| format!("解析内嵌示例 Lody Catalog 失败: {e}"))
+    None
+}
+
+pub fn load_catalog_with_fallback(explicit_path: Option<&str>) -> Result<LodyCatalog, String> {
+    if let Some(p) = explicit_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let mut cat = load_catalog_file(&expand_tilde(p))?;
+        cat.source = Some("local-file".to_string());
+        cat.source_detail = Some(format!("手动指定快照: {p}"));
+        return Ok(cat);
+    }
+
+    let file_cat = load_file_catalog_if_exists();
+    if let Ok(live) = lody_discovery::discover_live_lody_catalog() {
+        return Ok(match file_cat {
+            Some((fc, _)) => lody_discovery::merge_catalogs(live, fc),
+            None => live,
+        });
+    }
+
+    if let Some((fc, _)) = file_cat {
+        return Ok(fc);
+    }
+
+    let mut fallback: LodyCatalog = serde_json::from_str(EMBEDDED_EXAMPLE_CATALOG)
+        .map_err(|e| format!("解析内嵌示例 Lody Catalog 失败: {e}"))?;
+    fallback.source = Some("example-fallback".to_string());
+    fallback.source_detail = Some(
+        "未检测到本机运行中的 Lody Desktop / Daemon，也未找到 ~/.agentport/lody-catalog.json，当前仅显示示例数据。请先启动 Lody 后点击「刷新 Lody」。"
+            .to_string(),
+    );
+    fallback.daemon_connected = false;
+    Ok(fallback)
 }

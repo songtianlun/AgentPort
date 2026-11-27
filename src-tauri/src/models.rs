@@ -152,6 +152,12 @@ pub struct LodyCatalog {
     pub machines: Vec<LodyMachine>,
     pub projects: Vec<LodyProject>,
     pub agent_configs: Vec<LodyAgentConfig>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_detail: Option<String>,
+    #[serde(default)]
+    pub daemon_connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

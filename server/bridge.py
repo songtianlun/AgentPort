@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -27,9 +28,282 @@ DEFAULT_OUTPUT = APP_ROOT / "migration-bundle"
 PORT = int(os.environ.get("MIGRATOR_BRIDGE_PORT", "4179"))
 
 
+def normalize_path(p: str | None) -> str:
+    if not p:
+        return ""
+    try:
+        resolved = str(Path(p).expanduser().resolve())
+    except Exception:
+        resolved = str(Path(p).expanduser())
+    return resolved.rstrip("/\\") or resolved
+
+
+def _find_running_daemon() -> dict[str, Any] | None:
+    candidates = []
+    env_dir = os.environ.get("LODY_DATA_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.extend([Path.home() / ".lody", Path.home() / ".lody-oss"])
+    for d in candidates:
+        rf = d / "run" / "daemon.json"
+        if rf.exists():
+            try:
+                data = json.loads(rf.read_text(encoding="utf-8"))
+                if data.get("socketPath") and data.get("controlSocketPath"):
+                    data["_dataDir"] = d
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def _unix_http_json(
+    sock_path: str, method: str, path: str, token: str | None, body: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    payload = json.dumps(body).encode("utf-8") if body is not None else b""
+    headers = [f"{method} {path} HTTP/1.1", "Host: localhost", "Connection: close"]
+    if token:
+        headers.append(f"x-lody-local-token: {token}")
+    if method == "POST":
+        headers.append("x-lody-local-control: 1")
+        headers.append("content-type: application/json")
+        headers.append(f"content-length: {len(payload)}")
+    req = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + payload
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5)
+        s.connect(sock_path)
+        s.sendall(req)
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+    raw = b"".join(chunks)
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    head_str = head.decode("utf-8", errors="replace")
+    if "transfer-encoding: chunked" in head_str.lower():
+        decoded = bytearray()
+        idx = 0
+        while idx < len(rest):
+            nl = rest.find(b"\r\n", idx)
+            if nl == -1:
+                break
+            size = int(rest[idx:nl].decode().split(";")[0], 16)
+            if size == 0:
+                break
+            start = nl + 2
+            decoded.extend(rest[start : start + size])
+            idx = start + size + 2
+        rest = bytes(decoded)
+    return json.loads(rest.decode("utf-8"))
+
+
+def _detect_local_agents(data_dir: Path, machine_id: str) -> list[dict[str, Any]]:
+    bin_dir = data_dir / "bin"
+    found: set[str] = set()
+    if bin_dir.is_dir():
+        for p in bin_dir.iterdir():
+            n = p.name.lower()
+            if "antigravity" in n or n == "agy":
+                found.add("antigravity")
+            elif "claude" in n:
+                found.add("claude")
+            elif "codex" in n:
+                found.add("codex")
+    if not found:
+        found = {"antigravity", "claude", "codex"}
+    res: list[dict[str, Any]] = []
+    if "antigravity" in found:
+        res.append(
+            {
+                "id": f"local-antigravity-{machine_id}",
+                "name": "Antigravity",
+                "machineId": machine_id,
+                "agentType": "antigravity",
+                "available": True,
+                "modes": ["default", "accept-edits", "plan"],
+                "models": [
+                    "gemini-4-neon",
+                    "gemini-4-carbon",
+                    "gemini-4-argon",
+                    "gemini-4-hydrogen",
+                    "claude-opus-5-5",
+                    "claude-sonnet-5-5",
+                ],
+                "planMode": True,
+                "fastMode": False,
+            }
+        )
+    if "claude" in found:
+        res.append(
+            {
+                "id": f"local-claude-{machine_id}",
+                "name": "Claude Code",
+                "machineId": machine_id,
+                "agentType": "claude",
+                "available": True,
+                "modes": ["default", "acceptEdits", "plan", "auto", "bypassPermissions"],
+                "models": ["default", "opus", "sonnet", "haiku"],
+                "planMode": True,
+                "fastMode": True,
+            }
+        )
+    if "codex" in found:
+        res.append(
+            {
+                "id": f"local-codex-{machine_id}",
+                "name": "Codex",
+                "machineId": machine_id,
+                "agentType": "codex",
+                "available": True,
+                "modes": ["read-only", "agent", "agent-auto-review", "agent-full-access"],
+                "models": ["gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-5.4"],
+                "planMode": True,
+                "fastMode": True,
+            }
+        )
+    return res
+
+
+def _discover_live_catalog() -> dict[str, Any] | None:
+    daemon = _find_running_daemon()
+    if not daemon:
+        return None
+    try:
+        health = _unix_http_json(daemon["socketPath"], "GET", "/healthz", daemon.get("token"))
+        machine_id = health["machineId"]
+        cli_ver = health.get("cliVersion") or daemon.get("version") or "unknown"
+        state = _unix_http_json(daemon["socketPath"], "GET", "/state", daemon.get("token"))
+        ws_list = state.get("connectedWorkspaces") or []
+        workspace_id = ws_list[0]["id"] if ws_list else "local-workspace"
+        ws_name = ws_list[0].get("name") if ws_list else workspace_id
+
+        proj_resp = _unix_http_json(
+            daemon["controlSocketPath"],
+            "POST",
+            "/project-control",
+            daemon.get("token"),
+            {"type": "local-project/list", "machineId": machine_id},
+        )
+        projects: list[dict[str, Any]] = []
+        for ws in (proj_resp.get("result") or {}).get("workspaces") or []:
+            if workspace_id == "local-workspace" and ws.get("workspaceId"):
+                workspace_id = ws["workspaceId"]
+                ws_name = ws.get("workspaceName") or workspace_id
+            for p in ws.get("projects") or []:
+                projects.append(
+                    {
+                        "id": p["localProjectId"],
+                        "name": p.get("name") or p["localProjectId"],
+                        "kind": "local",
+                        "machineId": machine_id,
+                        "rootPath": p.get("rootPath"),
+                        "repoFullName": None,
+                        "available": True,
+                    }
+                )
+        return {
+            "workspaceId": workspace_id,
+            "defaultMachineId": machine_id,
+            "machines": [
+                {"id": machine_id, "name": socket.gethostname(), "onlineStatus": "online"}
+            ],
+            "projects": projects,
+            "agentConfigs": _detect_local_agents(daemon["_dataDir"], machine_id),
+            "source": "lody-daemon-ipc",
+            "sourceDetail": f"已实时连接本机 Lody Daemon (v{cli_ver}) · 工作区「{ws_name}」· 发现 {len(projects)} 个本地项目",
+            "daemonConnected": True,
+        }
+    except Exception:
+        return None
+
+
+def _merge_catalogs(live: dict[str, Any], file_cat: dict[str, Any]) -> dict[str, Any]:
+    file_m_names = {m["id"]: m["name"] for m in file_cat.get("machines") or []}
+    for m in live["machines"]:
+        if m["id"] in file_m_names:
+            m["name"] = file_m_names[m["id"]]
+    seen_m = {m["id"] for m in live["machines"]}
+    for m in file_cat.get("machines") or []:
+        if m["id"] not in seen_m:
+            live["machines"].append(m)
+            seen_m.add(m["id"])
+
+    seen_p = {p["id"] for p in live["projects"]}
+    for p in file_cat.get("projects") or []:
+        if p["id"] not in seen_p:
+            live["projects"].append(p)
+            seen_p.add(p["id"])
+
+    file_agents = file_cat.get("agentConfigs") or []
+    has_file_for_default = any(a.get("machineId") == live["defaultMachineId"] for a in file_agents)
+    if has_file_for_default and all(a["id"].startswith("local-") for a in live["agentConfigs"]):
+        live["agentConfigs"] = file_agents
+    else:
+        seen_a = {a["id"] for a in live["agentConfigs"]}
+        for a in file_agents:
+            if a["id"] not in seen_a:
+                live["agentConfigs"].append(a)
+                seen_a.add(a["id"])
+    return live
+
+
 def load_catalog() -> dict[str, Any]:
-    path = DEFAULT_CATALOG if DEFAULT_CATALOG.exists() else EXAMPLE_CATALOG
-    return json.loads(path.read_text(encoding="utf-8"))
+    file_cat: dict[str, Any] | None = None
+    for cand in [Path.home() / ".agentport" / "lody-catalog.json", DEFAULT_CATALOG]:
+        if cand.exists():
+            try:
+                file_cat = json.loads(cand.read_text(encoding="utf-8"))
+                file_cat.setdefault("source", "local-file")
+                file_cat.setdefault("sourceDetail", f"从本地快照加载: {cand}")
+                file_cat.setdefault("daemonConnected", False)
+                break
+            except Exception:
+                pass
+
+    live = _discover_live_catalog()
+    if live:
+        return _merge_catalogs(live, file_cat) if file_cat else live
+    if file_cat:
+        return file_cat
+
+    fallback = json.loads(EXAMPLE_CATALOG.read_text(encoding="utf-8"))
+    fallback["source"] = "example-fallback"
+    fallback["sourceDetail"] = "未检测到本机运行中的 Lody Desktop / Daemon，当前仅显示示例数据。"
+    fallback["daemonConnected"] = False
+    return fallback
+
+
+def register_lody_local_project(root_path: str, workspace_id: str | None = None) -> dict[str, Any]:
+    daemon = _find_running_daemon()
+    if not daemon:
+        raise RuntimeError("未检测到本机运行中的 Lody Desktop / Daemon，无法自动注册项目")
+    health = _unix_http_json(daemon["socketPath"], "GET", "/healthz", daemon.get("token"))
+    machine_id = health["machineId"]
+    resolved = normalize_path(root_path)
+    req: dict[str, Any] = {
+        "type": "local-project/add",
+        "machineId": machine_id,
+        "rootPath": resolved,
+    }
+    if workspace_id:
+        req["workspace"] = workspace_id
+    resp = _unix_http_json(
+        daemon["controlSocketPath"], "POST", "/project-control", daemon.get("token"), req
+    )
+    if not resp.get("ok"):
+        raise RuntimeError(resp.get("message") or resp.get("error") or "Lody 注册项目失败")
+    res = resp.get("result") or {}
+    return {
+        "id": res.get("localProjectId") or "local-project-added",
+        "name": res.get("name") or Path(resolved).name,
+        "kind": "local",
+        "machineId": machine_id,
+        "rootPath": res.get("rootPath") or resolved,
+        "repoFullName": None,
+        "available": True,
+    }
 
 
 def utc_now() -> str:
@@ -425,11 +699,12 @@ def resolve_project_target(
     if project["isScratch"]:
         return "exact", {"kind": "chat"}, []
 
+    target_root_norm = normalize_path(project["workspaceRoot"])
     for lp in catalog["projects"]:
         if (
             lp["kind"] == "local"
             and lp.get("machineId") == target_machine_id
-            and lp.get("rootPath") == project["workspaceRoot"]
+            and normalize_path(lp.get("rootPath")) == target_root_norm
         ):
             return "exact", {"kind": "local", "projectId": lp["id"]}, []
 
@@ -729,6 +1004,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
             if parsed.path == "/api/export":
                 self._send_json(200, export_bundle(body))
+            elif parsed.path == "/api/lody/register-project":
+                self._send_json(
+                    200,
+                    register_lody_local_project(body["rootPath"], body.get("workspaceId")),
+                )
             else:
                 self._send_json(404, {"error": f"Unknown endpoint: {parsed.path}"})
         except Exception as exc:

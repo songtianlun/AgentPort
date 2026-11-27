@@ -125,6 +125,9 @@ export interface LodyCatalog {
   machines: LodyMachine[];
   projects: LodyProject[];
   agentConfigs: LodyAgentConfig[];
+  source?: string;
+  sourceDetail?: string;
+  daemonConnected?: boolean;
 }
 
 export interface ProjectMappingOverride {

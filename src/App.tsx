@@ -9,7 +9,12 @@ import {
   RefreshCw,
   Server,
 } from 'lucide-react';
-import { getLodyCatalog, getRuntimeInfo, scanT3Database } from './api';
+import {
+  getLodyCatalog,
+  getRuntimeInfo,
+  registerLodyLocalProject,
+  scanT3Database,
+} from './api';
 import { AgentsTab } from './components/AgentsTab';
 import { ExportTab } from './components/ExportTab';
 import { OverviewTab } from './components/OverviewTab';
@@ -50,7 +55,10 @@ export default function App() {
       setDbPath(effectiveDb);
       setDefaultOutputDir(info.defaultOutputDir);
       setCatalog(cat);
-      setTargetMachineId((prev) => prev || cat.defaultMachineId);
+      setTargetMachineId((prev) => {
+        if (prev && cat.machines.some((m) => m.id === prev)) return prev;
+        return cat.defaultMachineId;
+      });
 
       const scanRes = await scanT3Database(effectiveDb);
       setScan(scanRes);
@@ -60,6 +68,29 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const refreshCatalogOnly = async () => {
+    setError(null);
+    try {
+      const cat = await getLodyCatalog();
+      setCatalog(cat);
+      setTargetMachineId((prev) =>
+        prev && cat.machines.some((m) => m.id === prev) ? prev : cat.defaultMachineId
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleRegisterProject = async (projectId: string, rootPath: string) => {
+    await registerLodyLocalProject(rootPath, catalog?.workspaceId);
+    setProjectOverrides((prev) => {
+      const next = { ...prev };
+      delete next[projectId];
+      return next;
+    });
+    await refreshCatalogOnly();
   };
 
   useEffect(() => {
@@ -165,6 +196,26 @@ export default function App() {
               {runtime === 'tauri-native' ? 'Tauri 原生' : 'Web 预览桥接'}
             </span>
           </div>
+          {catalog && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>Lody 来源</span>
+              <span
+                className={`pill ${
+                  catalog.daemonConnected
+                    ? 'pill-green'
+                    : catalog.source === 'example-fallback'
+                      ? 'pill-amber'
+                      : 'pill-blue'
+                }`}
+              >
+                {catalog.daemonConnected
+                  ? '本机实时连接'
+                  : catalog.source === 'example-fallback'
+                    ? '示例数据'
+                    : '本地快照'}
+              </span>
+            </div>
+          )}
           <div>源库格式：{scan?.schemaVersion || '检测中'}</div>
           <div className="mono" style={{ fontSize: 10.5, wordBreak: 'break-all' }}>
             {scan?.dbPath || dbPath}
@@ -213,6 +264,53 @@ export default function App() {
             </div>
           )}
 
+          {catalog?.source === 'example-fallback' && (
+            <div
+              className="warn-box"
+              style={{
+                padding: '12px 14px',
+                marginTop: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                flexWrap: 'wrap',
+              }}
+            >
+              <div>
+                <strong>未连接到本机 Lody：</strong>{' '}
+                {catalog.sourceDetail ||
+                  '未检测到运行中的 Lody Desktop / Daemon，当前展示的是示例数据。请先启动 Lody 后重新探测。'}
+              </div>
+              <button className="btn" onClick={refreshCatalogOnly}>
+                <RefreshCw size={13} /> 重新探测本机 Lody
+              </button>
+            </div>
+          )}
+
+          {catalog?.daemonConnected && catalog.sourceDetail && (
+            <div
+              style={{
+                padding: '9px 14px',
+                borderRadius: 10,
+                background: 'var(--green-soft)',
+                border: '1px solid rgba(16, 185, 129, 0.28)',
+                color: '#a7f3d0',
+                fontSize: 12.5,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                flexWrap: 'wrap',
+              }}
+            >
+              <span>{catalog.sourceDetail}</span>
+              <button className="btn" style={{ padding: '4px 10px', fontSize: 12 }} onClick={refreshCatalogOnly}>
+                <RefreshCw size={12} /> 刷新 Lody 目录
+              </button>
+            </div>
+          )}
+
           {loading && !scan && (
             <div className="card" style={{ color: 'var(--muted)' }}>
               正在以只读模式扫描本机 T3 Code 数据库与 Git 仓库状态…
@@ -236,6 +334,7 @@ export default function App() {
                   catalog={catalog}
                   targetMachineId={targetMachineId}
                   overrides={projectOverrides}
+                  onRegisterProject={handleRegisterProject}
                   onOverrideChange={(pid, ov) =>
                     setProjectOverrides((prev) => {
                       const next = { ...prev };
