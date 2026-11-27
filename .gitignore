@@ -8,9 +8,13 @@ src-tauri/target/
 data/lody-catalog.json
 migration-bundle/
 test-bundle-check/
+server-go/data/
+server-go/static/dist/*
+!server-go/static/dist/.gitkeep
 
 # Databases & caches
 *.sqlite
+*.sqlite3
 *.sqlite-wal
 *.sqlite-shm
 __pycache__/

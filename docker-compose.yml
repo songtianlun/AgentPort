@@ -1,0 +1,17 @@
+services:
+  agentport-server:
+    image: ghcr.io/songtianlun/agentport:latest
+    container_name: agentport-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      AGENTPORT_ADDR: ":8080"
+      AGENTPORT_DATA_DIR: "/data"
+      # Optional: external public URL used when generating /s/<slug> share links
+      # AGENTPORT_PUBLIC_URL: "https://agentport.example.com"
+      # Optional: auto-create initial admin account on first boot
+      # AGENTPORT_ADMIN_USER: "admin"
+      # AGENTPORT_ADMIN_PASS: "change-me-please"

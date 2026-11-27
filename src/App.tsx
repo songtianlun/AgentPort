@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowRightLeft,
   Bot,
+  Cloud,
   FolderGit2,
   FolderOutput,
   LayoutDashboard,
@@ -10,33 +11,52 @@ import {
   Server,
 } from 'lucide-react';
 import {
+  backupToCloud,
+  detectServerCapabilities,
+  getCloudConfig,
   getLodyCatalog,
   getRuntimeInfo,
   registerLodyLocalProject,
   scanT3Database,
 } from './api';
 import { AgentsTab } from './components/AgentsTab';
+import { CloudSyncTab } from './components/CloudSyncTab';
 import { ExportTab } from './components/ExportTab';
 import { OverviewTab } from './components/OverviewTab';
 import { ProjectsTab } from './components/ProjectsTab';
+import { ServerDashboard } from './components/ServerDashboard';
+import { SharePublicView } from './components/SharePublicView';
 import { ThreadsTab } from './components/ThreadsTab';
 import { resolveAgentGroups, resolveProjectMapping } from './planner';
 import type {
   AgentMappingOverride,
+  CloudServerConfig,
   LodyCatalog,
   ProjectMappingOverride,
+  ServerCapabilities,
   T3ScanResult,
 } from './types';
 
-type TabKey = 'overview' | 'projects' | 'agents' | 'threads' | 'export';
+type TabKey = 'overview' | 'projects' | 'agents' | 'threads' | 'export' | 'cloud';
+
+function extractPublicShareSlug(): string | null {
+  if (typeof window === 'undefined') return null;
+  const m = window.location.pathname.match(/^\/s\/([A-Za-z0-9_-]+)\/?$/);
+  return m ? m[1] : null;
+}
 
 export default function App() {
+  const shareSlug = useMemo(() => extractPublicShareSlug(), []);
+  const [serverCaps, setServerCaps] = useState<ServerCapabilities | null>(null);
+  const [modeChecked, setModeChecked] = useState<boolean>(Boolean(shareSlug));
+
   const [tab, setTab] = useState<TabKey>('overview');
   const [runtime, setRuntime] = useState<'tauri-native' | 'web-bridge'>('web-bridge');
   const [dbPath, setDbPath] = useState('');
   const [defaultOutputDir, setDefaultOutputDir] = useState('./migration-bundle');
   const [scan, setScan] = useState<T3ScanResult | null>(null);
   const [catalog, setCatalog] = useState<LodyCatalog | null>(null);
+  const [cloudCfg, setCloudCfg] = useState<CloudServerConfig | null>(null);
   const [targetMachineId, setTargetMachineId] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -63,12 +83,55 @@ export default function App() {
       const scanRes = await scanT3Database(effectiveDb);
       setScan(scanRes);
       setSelectedThreadIds(new Set(scanRes.threads.map((t) => t.id)));
+      getCloudConfig()
+        .then((c) => setCloudCfg(c))
+        .catch(() => {});
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (shareSlug) return;
+    let cancelled = false;
+    detectServerCapabilities().then((caps) => {
+      if (cancelled) return;
+      if (caps) {
+        setServerCaps(caps);
+        setModeChecked(true);
+      } else {
+        setModeChecked(true);
+        loadAll();
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shareSlug]);
+
+  // Background auto-backup timer when enabled in Desktop Cloud Config
+  useEffect(() => {
+    if (
+      !cloudCfg?.autoBackupEnabled ||
+      !cloudCfg.serverUrl ||
+      !cloudCfg.apiToken ||
+      !scan
+    ) {
+      return;
+    }
+    const mins = Math.max(5, cloudCfg.autoBackupIntervalMinutes || 30);
+    const id = window.setInterval(() => {
+      backupToCloud({
+        dbPath,
+        selectedThreadIds: [],
+        includeArchived: false,
+      }).catch(() => {});
+    }, mins * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [cloudCfg, dbPath, scan]);
 
   const refreshCatalogOnly = async () => {
     setError(null);
@@ -93,11 +156,6 @@ export default function App() {
     await refreshCatalogOnly();
   };
 
-  useEffect(() => {
-    loadAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const projectMappings = useMemo(() => {
     if (!scan || !catalog || !targetMachineId) return [];
     return scan.projects.map((p) =>
@@ -109,6 +167,22 @@ export default function App() {
     if (!scan || !catalog || !targetMachineId) return [];
     return resolveAgentGroups(scan.threads, catalog, targetMachineId, agentOverrides);
   }, [scan, catalog, targetMachineId, agentOverrides]);
+
+  if (shareSlug) {
+    return <SharePublicView slug={shareSlug} />;
+  }
+
+  if (!modeChecked) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--muted)' }}>
+        正在检测运行环境…
+      </div>
+    );
+  }
+
+  if (serverCaps) {
+    return <ServerDashboard initialCaps={serverCaps} />;
+  }
 
   const actionProjCount = projectMappings.filter((p) => p.status === 'action_required').length;
   const degradedAgentCount = agentGroups.filter((g) => g.warnings.length > 0).length;
@@ -131,7 +205,7 @@ export default function App() {
           </div>
           <div>
             <h1>AgentPort</h1>
-            <p>AI 编程工作区迁移工坊</p>
+            <p>AI 编程工作区迁移与备份</p>
           </div>
         </div>
 
@@ -184,8 +258,17 @@ export default function App() {
             onClick={() => setTab('export')}
           >
             <span className="nav-left">
-              <FolderOutput size={15} /> 导出与迁移
+              <FolderOutput size={15} /> 迁移与本地备份
             </span>
+          </button>
+          <button
+            className={`nav-item ${tab === 'cloud' ? 'active' : ''}`}
+            onClick={() => setTab('cloud')}
+          >
+            <span className="nav-left">
+              <Cloud size={15} /> 云备份与分享
+            </span>
+            {cloudCfg?.autoBackupEnabled && <span className="pill pill-green">自动</span>}
           </button>
         </nav>
 
@@ -383,6 +466,14 @@ export default function App() {
                   projectMappings={projectMappings}
                   projectOverrides={projectOverrides}
                   agentOverrides={agentOverrides}
+                />
+              )}
+              {tab === 'cloud' && (
+                <CloudSyncTab
+                  scan={scan}
+                  dbPath={dbPath}
+                  selectedIds={selectedThreadIds}
+                  onConfigUpdated={(c) => setCloudCfg(c)}
                 />
               )}
             </>

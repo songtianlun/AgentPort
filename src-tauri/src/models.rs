@@ -271,3 +271,95 @@ pub struct ImportToLodyResult {
     pub items: Vec<ImportItemOutcome>,
     pub state_records: Vec<MigrationStateRecord>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudServerConfig {
+    pub server_url: String,
+    pub api_token: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub auto_backup_enabled: bool,
+    #[serde(default = "default_auto_interval")]
+    pub auto_backup_interval_minutes: u32,
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
+}
+
+fn default_auto_interval() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudConnectionStatus {
+    pub ok: bool,
+    pub server_url: String,
+    pub username: Option<String>,
+    pub server_version: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBackupRequest {
+    pub db_path: Option<String>,
+    pub selected_thread_ids: Vec<String>,
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBackupProgress {
+    pub phase: String,
+    pub total: usize,
+    pub processed: usize,
+    pub uploaded: usize,
+    pub unchanged: usize,
+    pub blobs_uploaded: usize,
+    pub failed: usize,
+    pub current_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBackupResult {
+    pub total_considered: usize,
+    pub uploaded: usize,
+    pub unchanged: usize,
+    pub blobs_uploaded: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
+    pub synced_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudShareRequest {
+    pub db_path: Option<String>,
+    pub thread_id: String,
+    pub title: Option<String>,
+    pub password: Option<String>,
+    pub expires_in_hours: Option<u32>,
+    #[serde(default = "default_true")]
+    pub redact_secrets: bool,
+    #[serde(default = "default_true")]
+    pub hide_paths: bool,
+    #[serde(default)]
+    pub include_patch: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudShareResult {
+    pub slug: String,
+    pub share_url: String,
+    pub session_id: String,
+    pub has_password: bool,
+    pub redaction_count: usize,
+    pub expires_at: Option<String>,
+}

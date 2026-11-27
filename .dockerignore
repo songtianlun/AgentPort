@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+dist
+src-tauri
+migration-bundle
+test-bundle-check
+data/lody-catalog.json
+server-go/data
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store

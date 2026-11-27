@@ -1,3 +1,4 @@
+mod cloud_sync;
 mod exporter;
 mod lody_discovery;
 mod models;
@@ -121,6 +122,57 @@ async fn import_to_lody(
     .map_err(|e| format!("后台导入任务异常: {e}"))?
 }
 
+#[tauri::command]
+async fn get_cloud_config() -> Result<CloudServerConfig, String> {
+    tauri::async_runtime::spawn_blocking(cloud_sync::load_cloud_config)
+        .await
+        .map_err(|e| format!("读取云配置失败: {e}"))
+}
+
+#[tauri::command]
+async fn save_cloud_config(config: CloudServerConfig) -> Result<CloudServerConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || cloud_sync::save_cloud_config(config))
+        .await
+        .map_err(|e| format!("保存云配置失败: {e}"))?
+}
+
+#[tauri::command]
+async fn test_cloud_connection(
+    server_url: String,
+    api_token: String,
+) -> Result<CloudConnectionStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cloud_sync::test_connection(&server_url, &api_token)
+    })
+    .await
+    .map_err(|e| format!("测试服务器连接失败: {e}"))
+}
+
+#[tauri::command]
+async fn backup_to_cloud(
+    app: AppHandle,
+    request: CloudBackupRequest,
+) -> Result<CloudBackupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = t3_reader::resolve_db_path(request.db_path.as_deref());
+        cloud_sync::backup_to_cloud_with_progress(&db, &request, |progress| {
+            let _ = app.emit("cloud-backup-progress", &progress);
+        })
+    })
+    .await
+    .map_err(|e| format!("云端备份任务异常: {e}"))?
+}
+
+#[tauri::command]
+async fn create_cloud_share(request: CloudShareRequest) -> Result<CloudShareResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = t3_reader::resolve_db_path(request.db_path.as_deref());
+        cloud_sync::create_cloud_share(&db, &request)
+    })
+    .await
+    .map_err(|e| format!("创建云分享失败: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -134,7 +186,12 @@ pub fn run() {
             export_migration_bundle,
             read_migration_state,
             cancel_lody_import,
-            import_to_lody
+            import_to_lody,
+            get_cloud_config,
+            save_cloud_config,
+            test_cloud_connection,
+            backup_to_cloud,
+            create_cloud_share
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

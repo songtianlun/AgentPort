@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  check:
-    name: Build & Check (Frontend + Rust + Bridge)
+  desktop-check:
+    name: Frontend + Tauri Rust Check
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -49,3 +49,22 @@ jobs:
 
       - name: Cargo check (Tauri backend)
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  server-go-test:
+    name: Go Server Unit Tests & Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Test and build Go server
+        working-directory: server-go
+        run: |
+          go mod tidy
+          go test -v ./...
+          CGO_ENABLED=0 go build -o /tmp/agentport-server .

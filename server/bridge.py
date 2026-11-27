@@ -19,6 +19,212 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import urllib.error
+import urllib.request
+
+CLOUD_CONFIG_PATH = Path.home() / ".agentport" / "cloud-config.json"
+
+
+def load_cloud_config() -> dict[str, Any]:
+    if CLOUD_CONFIG_PATH.exists():
+        try:
+            return json.loads(CLOUD_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "serverUrl": "",
+        "apiToken": "",
+        "deviceName": socket.gethostname(),
+        "autoBackupEnabled": False,
+        "autoBackupIntervalMinutes": 30,
+        "lastSyncAt": None,
+    }
+
+
+def save_cloud_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    cleaned = {
+        "serverUrl": (cfg.get("serverUrl") or "").strip().rstrip("/"),
+        "apiToken": (cfg.get("apiToken") or "").strip(),
+        "deviceName": (cfg.get("deviceName") or socket.gethostname()).strip(),
+        "autoBackupEnabled": bool(cfg.get("autoBackupEnabled", False)),
+        "autoBackupIntervalMinutes": int(cfg.get("autoBackupIntervalMinutes") or 30),
+        "lastSyncAt": cfg.get("lastSyncAt"),
+    }
+    CLOUD_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CLOUD_CONFIG_PATH.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+    return cleaned
+
+
+def _cloud_http(method: str, url: str, token: str, payload: Any = None, content_type: str = "application/json") -> Any:
+    data = None
+    if payload is not None:
+        data = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {token.strip()}")
+    if data is not None:
+        req.add_header("Content-Type", content_type)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return json.loads(raw.decode("utf-8")) if raw else {"ok": True}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            msg = json.loads(body).get("error") or body[:200]
+        except Exception:
+            msg = body[:200]
+        raise RuntimeError(f"HTTP {e.code}: {msg}") from e
+
+
+def test_cloud_connection(server_url: str, api_token: str) -> dict[str, Any]:
+    base = (server_url or "").strip().rstrip("/")
+    if not base:
+        return {"ok": False, "serverUrl": base, "error": "请先填写服务器地址"}
+    try:
+        res = _cloud_http("GET", f"{base}/api/v1/auth/me", api_token)
+        return {
+            "ok": bool(res.get("ok", True)),
+            "serverUrl": base,
+            "username": (res.get("user") or {}).get("username"),
+            "serverVersion": res.get("version"),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"ok": False, "serverUrl": base, "error": str(exc)}
+
+
+def _thread_hash(t: dict[str, Any]) -> str:
+    raw = f"v1|{t['id']}|{t['updatedAt']}|{t['messageCount']}|{t['turnItemCount']}|{t['attachmentCount']}|{t['title']}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _upload_blob_if_needed(base: str, token: str, local_path: str, mime: str | None) -> tuple[str, bool]:
+    data = Path(local_path).read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    url = f"{base}/api/v1/blobs/{sha}"
+    try:
+        _cloud_http("HEAD", url, token)
+        return sha, False
+    except Exception:
+        _cloud_http("PUT", url, token, data, mime or "application/octet-stream")
+        return sha, True
+
+
+def _build_sync_payload(base: str, token: str, db_path: Path, proj: dict[str, Any] | None, t: dict[str, Any], machine: str, chash: str) -> tuple[dict[str, Any], int]:
+    detail = load_thread_detail(db_path, t["id"])
+    blobs = 0
+    msgs = []
+    for m in detail["messages"]:
+        atts = []
+        for a in m["attachments"]:
+            sha = ""
+            if a.get("localPath") and Path(a["localPath"]).exists():
+                try:
+                    sha, up = _upload_blob_if_needed(base, token, a["localPath"], a.get("mimeType"))
+                    if up:
+                        blobs += 1
+                except Exception:
+                    pass
+            atts.append({"id": a["id"], "name": a["name"], "mimeType": a.get("mimeType"), "sizeBytes": a.get("sizeBytes") or 0, "blobSha256": sha})
+        msgs.append({"id": m["id"], "role": m["role"], "text": m["text"], "createdAt": m["createdAt"], "attachments": atts})
+    payload = {
+        "sourceTool": "t3-code",
+        "machineId": machine,
+        "machineName": machine,
+        "sourceThreadId": t["id"],
+        "sourceProjectId": t["projectId"],
+        "projectTitle": t["projectTitle"],
+        "workspaceRoot": proj["workspaceRoot"] if proj else "",
+        "title": t["title"],
+        "provider": t["provider"],
+        "model": t.get("model") or "",
+        "branch": t.get("branch") or "",
+        "contentHash": chash,
+        "messageCount": len(msgs),
+        "turnItemCount": t["turnItemCount"],
+        "attachmentCount": t["attachmentCount"],
+        "sourceCreatedAt": t["createdAt"],
+        "sourceUpdatedAt": t["updatedAt"],
+        "messages": msgs,
+        "handoffMarkdown": detail["handoffMarkdown"],
+        "transcriptMarkdown": detail["transcriptMarkdown"],
+        "dirtyPatch": detail["uncommittedDiff"] or "",
+        "pullRequests": t["pullRequests"],
+    }
+    return payload, blobs
+
+
+def backup_to_cloud(req: dict[str, Any]) -> dict[str, Any]:
+    cfg = load_cloud_config()
+    base, token = cfg.get("serverUrl", "").rstrip("/"), cfg.get("apiToken", "")
+    if not base or not token:
+        raise RuntimeError("请先配置云端服务器地址和 API Token")
+    machine = cfg.get("deviceName") or socket.gethostname()
+    db_path = Path(req["dbPath"]).expanduser() if req.get("dbPath") else DEFAULT_DB
+    scan = scan_database(db_path)
+    proj_map = {p["id"]: p for p in scan["projects"]}
+    selected = set(req.get("selectedThreadIds") or [])
+    include_archived = bool(req.get("includeArchived", False))
+    threads = [t for t in scan["threads"] if (not selected or t["id"] in selected) and (include_archived or not t.get("archivedAt"))]
+
+    hashes = {t["id"]: _thread_hash(t) for t in threads}
+    diff = _cloud_http("POST", f"{base}/api/v1/sync/diff", token, {
+        "items": [{"sourceTool": "t3-code", "machineId": machine, "sourceThreadId": t["id"], "contentHash": hashes[t["id"]]} for t in threads]
+    })
+    need = set(diff.get("needUpload") or [])
+    uploaded = unchanged = blobs = failed = 0
+    errors: list[str] = []
+    for t in threads:
+        if t["id"] not in need:
+            unchanged += 1
+            continue
+        try:
+            payload, b = _build_sync_payload(base, token, db_path, proj_map.get(t["projectId"]), t, machine, hashes[t["id"]])
+            blobs += b
+            _cloud_http("POST", f"{base}/api/v1/sync/sessions", token, payload)
+            uploaded += 1
+        except Exception as exc:
+            failed += 1
+            errors.append(f"{t['title']}: {exc}")
+    now = utc_now()
+    cfg["lastSyncAt"] = now
+    save_cloud_config(cfg)
+    return {"totalConsidered": len(threads), "uploaded": uploaded, "unchanged": unchanged, "blobsUploaded": blobs, "failed": failed, "errors": errors, "syncedAt": now}
+
+
+def create_cloud_share(req: dict[str, Any]) -> dict[str, Any]:
+    cfg = load_cloud_config()
+    base, token = cfg.get("serverUrl", "").rstrip("/"), cfg.get("apiToken", "")
+    if not base or not token:
+        raise RuntimeError("请先在「云备份与分享」页配置服务器地址和 API Token")
+    machine = cfg.get("deviceName") or socket.gethostname()
+    db_path = Path(req["dbPath"]).expanduser() if req.get("dbPath") else DEFAULT_DB
+    scan = scan_database(db_path)
+    t = next((x for x in scan["threads"] if x["id"] == req["threadId"]), None)
+    if not t:
+        raise KeyError("未找到指定会话")
+    proj = next((p for p in scan["projects"] if p["id"] == t["projectId"]), None)
+    payload, _ = _build_sync_payload(base, token, db_path, proj, t, machine, _thread_hash(t))
+    up = _cloud_http("POST", f"{base}/api/v1/sync/sessions", token, payload)
+    sid = up["sessionId"]
+    sh = _cloud_http("POST", f"{base}/api/v1/shares", token, {
+        "sessionId": sid,
+        "title": req.get("title") or t["title"],
+        "password": req.get("password") or "",
+        "expiresInHours": int(req.get("expiresInHours") or 0),
+        "redactSecrets": bool(req.get("redactSecrets", True)),
+        "hidePaths": bool(req.get("hidePaths", True)),
+        "includePatch": bool(req.get("includePatch", False)),
+    })
+    share = sh["share"]
+    return {
+        "slug": share["slug"],
+        "shareUrl": sh.get("shareUrl") or f"{base}/s/{share['slug']}",
+        "sessionId": sid,
+        "hasPassword": bool(share.get("hasPassword")),
+        "redactionCount": int(share.get("redactionCount") or 0),
+        "expiresAt": share.get("expiresAt"),
+    }
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = Path.home() / ".t3" / "userdata" / "statev2.sqlite"
@@ -1271,6 +1477,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(200, scan_database(db))
             elif parsed.path == "/api/catalog":
                 self._send_json(200, load_catalog())
+            elif parsed.path == "/api/cloud/config":
+                self._send_json(200, load_cloud_config())
             elif parsed.path == "/api/state":
                 out_dir = qs["outputDir"][0] if "outputDir" in qs and qs["outputDir"][0] else str(DEFAULT_OUTPUT)
                 self._send_json(200, load_migration_state(out_dir))
@@ -1293,6 +1501,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(200, export_bundle(body))
             elif parsed.path == "/api/import-lody":
                 self._send_json(200, import_to_lody(body))
+            elif parsed.path == "/api/cloud/config":
+                self._send_json(200, save_cloud_config(body))
+            elif parsed.path == "/api/cloud/test":
+                self._send_json(200, test_cloud_connection(body.get("serverUrl", ""), body.get("apiToken", "")))
+            elif parsed.path == "/api/cloud/backup":
+                self._send_json(200, backup_to_cloud(body))
+            elif parsed.path == "/api/cloud/share":
+                self._send_json(200, create_cloud_share(body))
             elif parsed.path == "/api/lody/register-project":
                 self._send_json(
                     200,

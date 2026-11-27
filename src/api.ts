@@ -1,4 +1,11 @@
 import type {
+  CloudBackupProgress,
+  CloudBackupRequest,
+  CloudBackupResult,
+  CloudConnectionStatus,
+  CloudServerConfig,
+  CloudShareRequest,
+  CloudShareResult,
   ExportRequest,
   ExportResult,
   ImportProgressEvent,
@@ -7,6 +14,12 @@ import type {
   LodyCatalog,
   LodyProject,
   MigrationStateRecord,
+  PublicShareResponse,
+  RemoteSession,
+  RemoteShareItem,
+  ServerAPIToken,
+  ServerCapabilities,
+  ServerUser,
   T3ScanResult,
   T3ThreadDetail,
 } from './types';
@@ -147,4 +160,210 @@ export async function subscribeImportProgress(
     handler(ev.payload);
   });
   return unlisten;
+}
+
+// --- Desktop Cloud Backup & Share Commands ---
+export async function getCloudConfig(): Promise<CloudServerConfig> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<CloudServerConfig>('get_cloud_config');
+  }
+  return httpJson<CloudServerConfig>('/api/cloud/config');
+}
+
+export async function saveCloudConfig(config: CloudServerConfig): Promise<CloudServerConfig> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<CloudServerConfig>('save_cloud_config', { config });
+  }
+  return httpJson<CloudServerConfig>('/api/cloud/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+}
+
+export async function testCloudConnection(
+  serverUrl: string,
+  apiToken: string
+): Promise<CloudConnectionStatus> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<CloudConnectionStatus>('test_cloud_connection', {
+      serverUrl,
+      apiToken,
+    });
+  }
+  return httpJson<CloudConnectionStatus>('/api/cloud/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ serverUrl, apiToken }),
+  });
+}
+
+export async function backupToCloud(request: CloudBackupRequest): Promise<CloudBackupResult> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<CloudBackupResult>('backup_to_cloud', { request });
+  }
+  return httpJson<CloudBackupResult>('/api/cloud/backup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+export async function subscribeCloudBackupProgress(
+  handler: (event: CloudBackupProgress) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<CloudBackupProgress>('cloud-backup-progress', (ev) => {
+    handler(ev.payload);
+  });
+  return unlisten;
+}
+
+export async function createCloudShare(request: CloudShareRequest): Promise<CloudShareResult> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<CloudShareResult>('create_cloud_share', { request });
+  }
+  return httpJson<CloudShareResult>('/api/cloud/share', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+// --- Go Server Mode & Public Share APIs ---
+export async function detectServerCapabilities(): Promise<ServerCapabilities | null> {
+  if (isTauriRuntime()) return null;
+  try {
+    const res = await fetch('/api/v1/capabilities', { credentials: 'include' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.mode === 'server') {
+      return data as ServerCapabilities;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function serverJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, { credentials: 'include', ...init });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return data as T;
+}
+
+export async function serverSetup(username: string, password: string): Promise<{ user: ServerUser }> {
+  return serverJson('/api/v1/auth/setup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function serverLogin(username: string, password: string): Promise<{ user: ServerUser }> {
+  return serverJson('/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function serverLogout(): Promise<void> {
+  await serverJson('/api/v1/auth/logout', { method: 'POST' });
+}
+
+export async function serverListSessions(params?: {
+  q?: string;
+  sourceTool?: string;
+  project?: string;
+}): Promise<RemoteSession[]> {
+  const sp = new URLSearchParams();
+  if (params?.q) sp.set('q', params.q);
+  if (params?.sourceTool) sp.set('sourceTool', params.sourceTool);
+  if (params?.project) sp.set('project', params.project);
+  const qs = sp.toString();
+  const data = await serverJson<{ items: RemoteSession[] }>(
+    `/api/v1/sessions${qs ? `?${qs}` : ''}`
+  );
+  return data.items || [];
+}
+
+export async function serverGetSession(id: string): Promise<RemoteSession> {
+  const data = await serverJson<{ session: RemoteSession }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}`
+  );
+  return data.session;
+}
+
+export async function serverDeleteSession(id: string): Promise<void> {
+  await serverJson(`/api/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export async function serverListShares(): Promise<RemoteShareItem[]> {
+  const data = await serverJson<{ items: RemoteShareItem[] }>('/api/v1/shares');
+  return data.items || [];
+}
+
+export async function serverCreateShare(payload: {
+  sessionId: string;
+  title?: string;
+  password?: string;
+  expiresInHours?: number;
+  redactSecrets: boolean;
+  hidePaths: boolean;
+  includePatch: boolean;
+}): Promise<{ share: RemoteShareItem; shareUrl: string }> {
+  return serverJson('/api/v1/shares', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function serverRevokeShare(slug: string): Promise<void> {
+  await serverJson(`/api/v1/shares/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+}
+
+export async function serverListTokens(): Promise<ServerAPIToken[]> {
+  const data = await serverJson<{ items: ServerAPIToken[] }>('/api/v1/tokens');
+  return data.items || [];
+}
+
+export async function serverCreateToken(
+  name: string,
+  deviceName: string
+): Promise<{ token: ServerAPIToken; plain: string }> {
+  return serverJson('/api/v1/tokens', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, deviceName }),
+  });
+}
+
+export async function serverRevokeToken(id: string): Promise<void> {
+  await serverJson(`/api/v1/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export async function publicGetShare(slug: string): Promise<PublicShareResponse> {
+  return serverJson<PublicShareResponse>(`/api/v1/public/shares/${encodeURIComponent(slug)}`);
+}
+
+export async function publicUnlockShare(
+  slug: string,
+  password: string
+): Promise<PublicShareResponse> {
+  return serverJson<PublicShareResponse>(
+    `/api/v1/public/shares/${encodeURIComponent(slug)}/unlock`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    }
+  );
 }

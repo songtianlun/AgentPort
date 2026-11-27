@@ -241,3 +241,199 @@ export interface ImportToLodyResult {
   items: ImportItemOutcome[];
   stateRecords: MigrationStateRecord[];
 }
+
+export interface CloudServerConfig {
+  serverUrl: string;
+  apiToken: string;
+  deviceName: string;
+  autoBackupEnabled: boolean;
+  autoBackupIntervalMinutes: number;
+  lastSyncAt?: string | null;
+}
+
+export interface CloudConnectionStatus {
+  ok: boolean;
+  serverUrl: string;
+  username?: string | null;
+  serverVersion?: string | null;
+  error?: string | null;
+}
+
+export interface CloudBackupRequest {
+  dbPath?: string;
+  selectedThreadIds: string[];
+  includeArchived: boolean;
+}
+
+export interface CloudBackupProgress {
+  phase: string;
+  total: number;
+  processed: number;
+  uploaded: number;
+  unchanged: number;
+  blobsUploaded: number;
+  failed: number;
+  currentTitle?: string | null;
+}
+
+export interface CloudBackupResult {
+  totalConsidered: number;
+  uploaded: number;
+  unchanged: number;
+  blobsUploaded: number;
+  failed: number;
+  errors: string[];
+  syncedAt: string;
+}
+
+export interface CloudShareRequest {
+  dbPath?: string;
+  threadId: string;
+  title?: string;
+  password?: string;
+  expiresInHours?: number;
+  redactSecrets: boolean;
+  hidePaths: boolean;
+  includePatch: boolean;
+}
+
+export interface CloudShareResult {
+  slug: string;
+  shareUrl: string;
+  sessionId: string;
+  hasPassword: boolean;
+  redactionCount: number;
+  expiresAt?: string | null;
+}
+
+// --- Server Mode & Public Share Types ---
+export interface ServerUser {
+  id: string;
+  username: string;
+  role: string;
+  createdAt: string;
+}
+
+export interface ServerCapabilities {
+  ok: boolean;
+  mode: 'server';
+  version: string;
+  initialized: boolean;
+  authenticated: boolean;
+  user?: ServerUser | null;
+  publicUrl?: string;
+}
+
+export interface ServerAPIToken {
+  id: string;
+  userId: string;
+  name: string;
+  deviceName: string;
+  prefix: string;
+  createdAt: string;
+  lastUsedAt?: string | null;
+  revokedAt?: string | null;
+}
+
+export interface RemoteSessionAttachment {
+  id: string;
+  name: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  blobSha256?: string;
+}
+
+export interface RemoteSessionMessage {
+  id: string;
+  role: string;
+  text: string;
+  createdAt: string;
+  attachments?: RemoteSessionAttachment[];
+}
+
+export interface RemoteSession {
+  id: string;
+  sourceTool: string;
+  machineId: string;
+  machineName: string;
+  sourceThreadId: string;
+  projectTitle: string;
+  workspaceRoot: string;
+  title: string;
+  provider: string;
+  model: string;
+  branch: string;
+  contentHash: string;
+  messageCount: number;
+  turnItemCount: number;
+  attachmentCount: number;
+  sourceCreatedAt: string;
+  sourceUpdatedAt: string;
+  syncedAt: string;
+  messages?: RemoteSessionMessage[];
+  handoffMarkdown?: string;
+  transcriptMarkdown?: string;
+  dirtyPatch?: string;
+  pullRequests?: Array<{
+    url: string;
+    repository?: string;
+    number?: number;
+    state?: string;
+    title?: string;
+    headBranch?: string;
+    baseBranch?: string;
+  }>;
+}
+
+export interface RemoteShareItem {
+  slug: string;
+  sessionId: string;
+  title: string;
+  hasPassword: boolean;
+  expiresAt?: string | null;
+  redactSecrets: boolean;
+  hidePaths: boolean;
+  includePatch: boolean;
+  redactionCount: number;
+  viewCount: number;
+  createdAt: string;
+  revokedAt?: string | null;
+  shareUrl: string;
+}
+
+export interface PublicShareResponse {
+  ok: boolean;
+  locked: boolean;
+  slug: string;
+  title?: string;
+  hasPassword: boolean;
+  redactSecrets?: boolean;
+  hidePaths?: boolean;
+  redactionCount?: number;
+  viewCount?: number;
+  expiresAt?: string | null;
+  createdAt: string;
+  snapshot?: {
+    title: string;
+    sourceTool: string;
+    projectTitle: string;
+    workspaceRoot?: string;
+    provider: string;
+    model: string;
+    branch?: string;
+    sourceUpdatedAt: string;
+    messages: RemoteSessionMessage[];
+    handoffMarkdown?: string;
+    dirtyPatch?: string;
+    pullRequests?: Array<{
+      url: string;
+      state?: string;
+      headBranch?: string;
+      baseBranch?: string;
+    }>;
+    redactionReport?: {
+      totalReplacements: number;
+      byCategory?: Record<string, number>;
+    };
+  };
+}
