@@ -1,6 +1,6 @@
 # Dependencies & Build artifacts
 node_modules/
-dist/
+/dist/
 tsconfig.tsbuildinfo
 src-tauri/target/
 
